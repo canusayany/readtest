@@ -10,6 +10,7 @@ const CELL_SIZE = 34;
 const TICK_RATE_MS = 100;
 const MOVEMENT_SPEED = 0.15;
 const DEADLOCK_THRESHOLD_TICKS = 300; // 30 seconds
+const RESERVATION_LOOKAHEAD = 6; // How many cells ahead to reserve (allows following)
 
 type CellType = 'empty' | 'track' | 'station';
 
@@ -29,11 +30,13 @@ interface Train {
   path: string[];
   currentPathIndex: number;
   progress: number;
-  state: 'moving' | 'waiting' | 'arrived';
+  state: 'moving' | 'waiting' | 'arrived' | 'dwelling';
   priority: number;
   type: 'manual' | 'schedule';
   color: string;
   waitingTime: number; // Ticks spent waiting
+  isCyclic: boolean;
+  dwellRemaining: number;
 }
 
 interface ScheduleItem {
@@ -52,12 +55,14 @@ interface HistoryItem {
   to: string;
   priority: number;
   type: 'manual' | 'schedule';
+  isCyclic: boolean;
 }
 
 // --- Helper Functions ---
 
 const getCellId = (x: number, y: number) => `${x}-${y}`;
-const parseCellId = (id: string) => {
+const parseCellId = (id: string | undefined) => {
+  if (!id) return { x: 0, y: 0 };
   const [x, y] = id.split('-').map(Number);
   return { x, y };
 };
@@ -83,6 +88,7 @@ interface Node {
 }
 
 const getHeuristic = (x1: number, y1: number, x2: number, y2: number) => {
+  // Manhattan distance is usually best for grid
   return Math.abs(x1 - x2) + Math.abs(y1 - y2);
 };
 
@@ -120,6 +126,7 @@ function App() {
   const [dispatchFrom, setDispatchFrom] = useState("");
   const [dispatchTo, setDispatchTo] = useState("");
   const [dispatchPriority, setDispatchPriority] = useState(5);
+  const [dispatchIsCyclic, setDispatchIsCyclic] = useState(false);
 
   const [historyFilterFrom, setHistoryFilterFrom] = useState("");
   const [historyFilterTo, setHistoryFilterTo] = useState("");
@@ -212,9 +219,10 @@ function App() {
     setGlobalDeadlockWarning(false);
     setDispatchFrom("");
     setDispatchTo("");
+    setDispatchIsCyclic(false);
   };
 
-  // --- Pathfinding ---
+  // --- A* Pathfinding Logic (Weighted) ---
 
   const findPathAStar = (
     startId: string, 
@@ -222,7 +230,8 @@ function App() {
     currentGrid: Record<string, Cell>,
     currentTrains: Train[] = [], 
     ignoreTrainId?: string,
-    reservedCells?: Set<string>
+    reservedCells?: Set<string>,
+    strictMode: boolean = false // If true, treats reserved cells as WALLS
   ): string[] | null => {
     
     if (!currentGrid[startId] || !currentGrid[endId]) return null;
@@ -232,10 +241,13 @@ function App() {
 
     currentTrains.forEach(t => {
       if (t.id === ignoreTrainId) return;
+      // Consider all cells in the train's CURRENT planned path as "soft" obstacles
+      // But specifically, where the train IS currently is a "hard" obstacle for movement
       const tPos = t.path[t.currentPathIndex];
+      if (!tPos) return; // Guard against undefined path index
+
       occupiedCells.add(tPos);
       
-      // Add adjacent for "near congestion" penalty
       const pos = parseCellId(tPos);
       const neighbors = [[0,1], [0,-1], [1,0], [-1,0]];
       neighbors.forEach(([dx, dy]) => {
@@ -289,20 +301,38 @@ function App() {
         if (neighborCell && (neighborCell.type === 'track' || neighborCell.type === 'station')) {
           let moveCost = 1;
           
-          // --- Dynamic Weighting Strategy ---
-          // 1. Occupied by a train physically: Very high cost (avoid collision)
-          if (occupiedCells.has(nid) && nid !== endId) {
-             moveCost += 500;
+          // STRICT MODE: Treat reserved cells as walls (unless it's the destination)
+          if (strictMode && reservedCells && reservedCells.has(nid) && nid !== endId) {
+             continue; // Unwalkable
           }
 
-          // 2. Reserved by another train's critical path: Extremely high cost (avoid deadlock)
-          if (reservedCells && reservedCells.has(nid) && nid !== endId) {
+          // --- Dynamic Weighting Strategy ---
+          
+          // 1. Occupied by a train physically: Moderate penalty
+          if (occupiedCells.has(nid) && nid !== endId) {
+             moveCost += 20; 
+          }
+
+          // 2. Reserved by another train's critical path: High cost
+          // If NOT strict mode, we allow passing through reservations with high cost (waiting behavior)
+          if (!strictMode && reservedCells && reservedCells.has(nid) && nid !== endId) {
             moveCost += 1000;
           }
 
-          // 3. Near other trains: Small penalty to prefer clearance
+          // 3. Near other trains: Slight penalty (prefer space)
           if (nearCongestionCells.has(nid)) {
-            moveCost += 10;
+            moveCost += 2;
+          }
+
+          // 4. Turn Penalty: Prefer straight lines
+          if (current.parent) {
+             const dx = nx - current.x;
+             const dy = ny - current.y;
+             const pdx = current.x - current.parent.x;
+             const pdy = current.y - current.parent.y;
+             if (dx !== pdx || dy !== pdy) {
+                 moveCost += 0.5;
+             }
           }
 
           const newG = current.g + moveCost;
@@ -325,17 +355,7 @@ function App() {
         }
       }
     }
-    // No path found
     return null;
-  };
-
-  const getNextStationIndex = (path: string[], currentIndex: number, currentGrid: Record<string, Cell>): number => {
-    for (let i = currentIndex + 1; i < path.length; i++) {
-      if (currentGrid[path[i]].type === 'station') {
-        return i;
-      }
-    }
-    return path.length - 1; 
   };
 
   const isPathClear = (
@@ -352,12 +372,15 @@ function App() {
       const occupier = allTrains.find(t => {
         if (t.id === myTrainId) return false;
         const tPos = t.path[t.currentPathIndex];
-        // Occupied if train is at cell OR moving into cell
-        const isAtCell = tPos === cellId;
-        const isMovingToCell = (t.state === 'moving') && 
-                               (t.currentPathIndex + 1 < t.path.length) &&
-                               (t.path[t.currentPathIndex + 1] === cellId);
-        return isAtCell || isMovingToCell;
+        
+        // Occupied if train is AT cell
+        if (tPos === cellId) return true;
+        
+        // OR moving INTO cell (next step)
+        if (t.state === 'moving' && t.currentPathIndex + 1 < t.path.length) {
+          if (t.path[t.currentPathIndex + 1] === cellId) return true;
+        }
+        return false;
       });
 
       if (occupier) return false;
@@ -365,15 +388,14 @@ function App() {
     return true;
   };
 
-  const dispatchTrain = (fromName: string, toName: string, priority: number, isManual: boolean) => {
-    if (fromName === toName) return; // Prevent same station dispatch
+  const dispatchTrain = (fromName: string, toName: string, priority: number, isManual: boolean, isCyclic: boolean = false) => {
+    if (fromName === toName) return; 
 
     const stationsList = (Object.values(gridRef.current) as Cell[]).filter(c => c.type === 'station');
     const from = stationsList.find(s => s.stationName === fromName);
     const to = stationsList.find(s => s.stationName === toName);
     
     if (from && to) {
-      // Initial pathfinding (ignoring strict reservations to just find A path)
       const path = findPathAStar(from.id, to.id, gridRef.current, trainsRef.current);
       if (path) {
         const trainId = `${isManual ? 'man' : 'sch'}-${Date.now()}-${Math.random().toString(36).substr(2, 4)}`;
@@ -389,18 +411,20 @@ function App() {
           priority: priority,
           type: isManual ? 'manual' : 'schedule',
           color: getUniqueColor(trainsRef.current),
-          waitingTime: 0
+          waitingTime: 0,
+          isCyclic: isCyclic,
+          dwellRemaining: 0
         };
         setTrains(prev => [...prev, newTrain]);
         
-        // Add to history
         setHistory(prev => [{
           id: `hist-${Date.now()}-${Math.random()}`,
           time: timeRef.current,
           from: fromName,
           to: toName,
           priority: priority,
-          type: isManual ? 'manual' : 'schedule'
+          type: isManual ? 'manual' : 'schedule',
+          isCyclic: isCyclic
         }, ...prev]);
 
       } else {
@@ -481,13 +505,10 @@ function App() {
   useEffect(() => {
     if (!isRunning) return;
 
-    // Use a stable loop that references current state via refs, instead of recreating interval on every time change
     const tick = setInterval(() => {
-      // 1. Advance Time
       const currentTime = timeRef.current + 1;
       setTime(currentTime);
       
-      // 2. Dispatch New Trains (from Schedule)
       const currentSched = scheduleRef.current;
       const updatedSched = currentSched.map(item => {
         if (!item.dispatched && item.time <= currentTime) {
@@ -501,20 +522,69 @@ function App() {
         setSchedule(updatedSched);
       }
 
-      // 3. Process Trains
+      // Process Trains
       let activeTrains = [...trainsRef.current];
       const globalReservations = new Set<string>();
       
+      // Sort by priority (Higher first)
       activeTrains.sort((a, b) => b.priority - a.priority);
 
       const nextTrainsState = activeTrains.map(train => {
-        let { currentPathIndex, progress, state, path, waitingTime } = train;
-        if (state === 'arrived') return train;
+        let { currentPathIndex, progress, state, path, waitingTime, dwellRemaining } = train;
+        
+        // --- DWELLING (Cyclic) ---
+        if (state === 'dwelling') {
+           if (dwellRemaining > 0) {
+              return { ...train, dwellRemaining: dwellRemaining - 1 };
+           }
+           const newFrom = train.toId;
+           const newTo = train.fromId;
+           
+           // When dwelling finishes, finding path
+           const returnPath = findPathAStar(
+              newFrom, 
+              newTo, 
+              gridRef.current, 
+              trainsRef.current, 
+              train.id
+           );
+           
+           if (returnPath && returnPath.length > 0) {
+              return {
+                 ...train,
+                 fromId: newFrom,
+                 toId: newTo,
+                 path: returnPath,
+                 currentPathIndex: 0,
+                 progress: 0,
+                 state: 'waiting',
+                 waitingTime: 0,
+                 dwellRemaining: 0
+              };
+           } else {
+              return { ...train, dwellRemaining: 10 };
+           }
+        }
+
+        // --- ARRIVED ---
+        if (state === 'arrived') {
+           if (train.isCyclic) {
+              return { ...train, state: 'dwelling', dwellRemaining: 30 };
+           }
+           return train; 
+        }
+
+        // Safety check
+        if (!path || !path[currentPathIndex]) {
+           // Invalid path state, potentially arrived or error
+           return { ...train, state: 'arrived' };
+        }
+
         const currentCellId = path[currentPathIndex];
         
-        // MOVING -> WAITING
+        // --- MOVING -> WAITING TRANSITION ---
         if (state === 'moving') {
-          waitingTime = 0; // Reset waiting time if moving
+          waitingTime = 0;
           progress += MOVEMENT_SPEED;
           if (progress >= 1.0) {
             progress = 0;
@@ -523,7 +593,7 @@ function App() {
           }
         }
 
-        // WAITING Logic
+        // --- WAITING / PLANNING NEXT MOVE ---
         if (state === 'waiting') {
            if (currentPathIndex >= path.length - 1) {
              return { ...train, state: 'arrived', progress: 0, currentPathIndex, waitingTime: 0 };
@@ -531,59 +601,77 @@ function App() {
 
            const isAtStation = gridRef.current[path[currentPathIndex]]?.type === 'station';
 
-           // Determine the segment we MUST reserve to move safely
-           let nextStationIdx = getNextStationIndex(path, currentPathIndex, gridRef.current);
-           let segmentToReserve = path.slice(currentPathIndex + 1, nextStationIdx + 1);
+           // Sliding Window Reservation: Reserve up to N steps ahead OR until next station
+           // This allows "Following" behavior.
+           const segmentEndIdx = Math.min(path.length, currentPathIndex + RESERVATION_LOOKAHEAD);
+           let segmentToReserve = path.slice(currentPathIndex + 1, segmentEndIdx);
            
-           if (isAtStation) {
-              const blocked = !isPathClear(segmentToReserve, train.id, trainsRef.current, globalReservations);
-              if (blocked) {
-                // Reroute Attempt: Try to find ANY other valid path accounting for current reservations
-                const reroutePath = findPathAStar(
-                  path[currentPathIndex], 
-                  train.toId, 
-                  gridRef.current, 
-                  trainsRef.current,
-                  train.id,
-                  globalReservations
-                );
+           const blocked = !isPathClear(segmentToReserve, train.id, trainsRef.current, globalReservations);
 
-                // If a path is found, adopt it immediately
-                // We check if it exists and has length > 0.
-                // We do NOT check "detourPath[1] !== current" because even if the first step is the same,
-                // the subsequent steps might differ, or the reservation logic needs a refreshed path.
-                if (reroutePath && reroutePath.length > 0) {
-                   path = [...path.slice(0, currentPathIndex), ...reroutePath.slice(1)];
-                   
-                   // Recalculate reservation needs based on NEW path
-                   nextStationIdx = getNextStationIndex(path, currentPathIndex, gridRef.current);
-                   segmentToReserve = path.slice(currentPathIndex + 1, nextStationIdx + 1);
-                }
+           if (blocked) {
+              // Reroute Attempt: Try to find a STRICTLY FREE path
+              // This is critical for bypasses. We force A* to treat reserved cells as walls.
+              const strictReroutePath = findPathAStar(
+                path[currentPathIndex], 
+                train.toId, 
+                gridRef.current, 
+                trainsRef.current,
+                train.id,
+                globalReservations,
+                true // STRICT MODE
+              );
+
+              if (strictReroutePath && strictReroutePath.length > 0) {
+                 // Found a guaranteed free path, switch immediately
+                 // IMPORTANT: Use slice(0, currentPathIndex + 1) to KEEP current position!
+                 path = [...path.slice(0, currentPathIndex + 1), ...strictReroutePath.slice(1)];
+                 
+                 // Re-calc reservation segment based on new path
+                 const newSegmentEndIdx = Math.min(path.length, currentPathIndex + RESERVATION_LOOKAHEAD);
+                 segmentToReserve = path.slice(currentPathIndex + 1, newSegmentEndIdx);
+              } 
+              else {
+                 // If no strict path, try a standard weighted reroute (maybe wait on a shorter blocked path?)
+                 // Only do this periodically to save CPU, or if waiting a long time
+                 if (waitingTime % 10 === 0) {
+                    const softReroutePath = findPathAStar(
+                        path[currentPathIndex], 
+                        train.toId, 
+                        gridRef.current, 
+                        trainsRef.current,
+                        train.id,
+                        globalReservations,
+                        false // Soft mode
+                    );
+                    if (softReroutePath && softReroutePath.length > 0) {
+                        path = [...path.slice(0, currentPathIndex + 1), ...softReroutePath.slice(1)];
+                    }
+                 }
               }
            }
 
-           // Try to move (on old path or new rerouted path)
+           // Check if clear (after potential reroute)
            if (isPathClear(segmentToReserve, train.id, trainsRef.current, globalReservations)) {
              segmentToReserve.forEach(cid => globalReservations.add(cid));
              state = 'moving';
              waitingTime = 0;
            } else {
-             // Still blocked
-             globalReservations.add(currentCellId); // Keep reserving current spot
+             // Blocked: Reserve current spot to prevent others from running into us
+             globalReservations.add(currentCellId);
              waitingTime++;
            }
         } 
         else if (state === 'moving') {
-           // Maintain reservation for moving trains
-           const nextStationIdx = getNextStationIndex(path, currentPathIndex, gridRef.current);
-           const segmentToKeep = path.slice(currentPathIndex + 1, nextStationIdx + 1);
+           // Maintain reservation for moving trains (Lookahead)
+           const segmentEndIdx = Math.min(path.length, currentPathIndex + RESERVATION_LOOKAHEAD);
+           const segmentToKeep = path.slice(currentPathIndex + 1, segmentEndIdx);
            segmentToKeep.forEach(cid => globalReservations.add(cid));
         }
 
         return { ...train, currentPathIndex, progress, state, path, waitingTime };
       });
 
-      const runningTrains = nextTrainsState.filter(t => t.state !== 'arrived');
+      const runningTrains = nextTrainsState.filter(t => t.state !== 'arrived' || t.isCyclic);
       
       if (runningTrains.length > 1 && runningTrains.every(t => t.state === 'waiting' && t.waitingTime > 20)) {
          setGlobalDeadlockWarning(true);
@@ -596,7 +684,7 @@ function App() {
     }, TICK_RATE_MS);
 
     return () => clearInterval(tick);
-  }, [isRunning]); // Removed 'time' dependency to stabilize the loop
+  }, [isRunning]); 
 
 
   // --- Event Handlers (Editor) ---
@@ -682,7 +770,7 @@ function App() {
   }, [dispatchFrom, dispatchTo, grid, stations, trains]);
 
   const handleManualDispatch = () => {
-    dispatchTrain(dispatchFrom, dispatchTo, dispatchPriority, true);
+    dispatchTrain(dispatchFrom, dispatchTo, dispatchPriority, true, dispatchIsCyclic);
   };
 
   // --- Render Helpers ---
@@ -720,6 +808,7 @@ function App() {
   const activeTrainPaths = useMemo(() => {
     return trains.map(t => {
       // Draw from current position to end
+      if (!t.path || t.path.length === 0) return null;
       const remainingPath = t.path.slice(Math.max(0, t.currentPathIndex));
       if (remainingPath.length < 2) return null;
       
@@ -766,6 +855,10 @@ function App() {
     if (!hoveredTrainId) return null;
     const train = trains.find(t => t.id === hoveredTrainId);
     if (!train) return null;
+    
+    // Guard against undefined path
+    if (!train.path || !train.path[train.currentPathIndex]) return null;
+
     const currentPos = parseCellId(train.path[train.currentPathIndex]);
     const nextPos = train.currentPathIndex < train.path.length - 1 
       ? parseCellId(train.path[train.currentPathIndex + 1]) 
@@ -876,6 +969,7 @@ function App() {
             ))}
             
             {trains.map(t => {
+              if (!t.path[t.currentPathIndex]) return null;
               const currentPos = parseCellId(t.path[t.currentPathIndex]);
               const nextPos = t.currentPathIndex < t.path.length - 1 
                 ? parseCellId(t.path[t.currentPathIndex + 1]) 
@@ -904,12 +998,14 @@ function App() {
                     cx={screenX} 
                     cy={screenY} 
                     r={CELL_SIZE * 0.35} 
-                    fill={t.state === 'waiting' ? '#ef4444' : t.color}
+                    fill={t.state === 'waiting' ? '#ef4444' : (t.state === 'dwelling' ? '#f59e0b' : t.color)}
                     stroke="white"
                     strokeWidth={isHovered ? "3" : "2"}
                     className="shadow-lg drop-shadow-md"
                   />
-                  <text x={screenX} y={screenY - 14} textAnchor="middle" fill="white" fontSize="10" fontWeight="bold" filter="drop-shadow(0px 1px 1px rgba(0,0,0,0.8))">{t.name}</text>
+                  <text x={screenX} y={screenY - 14} textAnchor="middle" fill="white" fontSize="10" fontWeight="bold" filter="drop-shadow(0px 1px 1px rgba(0,0,0,0.8))">
+                     {t.isCyclic ? '↻' : ''}{t.name}
+                  </text>
                 </g>
               );
             })}
@@ -926,10 +1022,18 @@ function App() {
               }}
             >
               <div className="font-bold text-xs text-white border-b border-slate-600 pb-1 mb-1 flex justify-between items-center">
-                <span>{hoveredTrainInfo.name}</span>
+                <span>{hoveredTrainInfo.name} {hoveredTrainInfo.isCyclic && <span className="text-blue-400 ml-1">(循环)</span>}</span>
                 <span className="px-1.5 rounded-full" style={{backgroundColor: hoveredTrainInfo.color}}></span>
               </div>
-              <div className="flex justify-between"><span>状态:</span> <span className={hoveredTrainInfo.state === 'waiting' ? 'text-red-400' : 'text-emerald-400'}>{hoveredTrainInfo.state === 'waiting' ? '等待中' : '运行中'}</span></div>
+              <div className="flex justify-between">
+                 <span>状态:</span> 
+                 <span className={hoveredTrainInfo.state === 'waiting' ? 'text-red-400' : (hoveredTrainInfo.state === 'dwelling' ? 'text-yellow-400' : 'text-emerald-400')}>
+                    {hoveredTrainInfo.state === 'waiting' ? '等待中' : (hoveredTrainInfo.state === 'dwelling' ? '折返中' : '运行中')}
+                 </span>
+              </div>
+              {hoveredTrainInfo.state === 'dwelling' && (
+                 <div className="flex justify-between"><span>折返剩余:</span> <span className="text-yellow-400">{hoveredTrainInfo.dwellRemaining}s</span></div>
+              )}
               <div className="flex justify-between"><span>等待:</span> <span className={`${hoveredTrainInfo.waitingTime > 20 ? 'text-rose-400 font-bold' : 'text-slate-400'}`}>{hoveredTrainInfo.waitingTime} Ticks</span></div>
               <div className="flex justify-between"><span>优先级:</span> <span className="text-orange-300 font-mono">P{hoveredTrainInfo.priority}</span></div>
               <div className="flex justify-between"><span>路线:</span> <span className="text-slate-400">{hoveredTrainInfo.fromStation} → {hoveredTrainInfo.toStation}</span></div>
@@ -995,6 +1099,10 @@ function App() {
                   {stations.map(s => <option key={s.id} value={s.stationName}>{s.stationName}</option>)}
                 </select>
               </div>
+              <div className="flex items-center gap-2">
+                 <input type="checkbox" id="cyclicCheck" checked={dispatchIsCyclic} onChange={(e) => setDispatchIsCyclic(e.target.checked)} className="rounded bg-slate-800 border-slate-600" />
+                 <label htmlFor="cyclicCheck" className="text-xs text-slate-300 select-none cursor-pointer">循环发车 (往返运行)</label>
+              </div>
               <input type="range" min="1" max="10" value={dispatchPriority} onChange={(e) => setDispatchPriority(Number(e.target.value))} className="w-full h-1 bg-slate-700 rounded-lg appearance-none cursor-pointer accent-orange-500"/>
               <button onClick={handleManualDispatch} disabled={previewPath.length === 0 || dispatchFrom === dispatchTo} className="w-full bg-orange-600 hover:bg-orange-500 disabled:bg-slate-700 text-white py-2 rounded-lg text-xs font-bold shadow-lg">立即发车</button>
             </div>
@@ -1052,11 +1160,12 @@ function App() {
                          <span className={`text-[9px] px-1 rounded ${item.type === 'manual' ? 'bg-orange-900/50 text-orange-400' : 'bg-blue-900/50 text-blue-400'}`}>
                            {item.type === 'manual' ? '手动' : '计划'}
                          </span>
+                         {item.isCyclic && <span className="text-[9px] px-1 rounded bg-purple-900/50 text-purple-400">循环</span>}
                       </div>
                       <span className="text-[10px] mt-0.5">{item.from} ➔ {item.to}</span>
                    </div>
                    <button 
-                     onClick={() => dispatchTrain(item.from, item.to, item.priority, true)}
+                     onClick={() => dispatchTrain(item.from, item.to, item.priority, true, item.isCyclic)}
                      className="opacity-0 group-hover:opacity-100 bg-emerald-600 hover:bg-emerald-500 text-white px-2 py-1 rounded text-[10px] transition-opacity"
                      title="使用相同参数再次发车"
                    >
