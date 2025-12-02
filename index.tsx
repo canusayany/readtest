@@ -4,9 +4,9 @@ import { GoogleGenAI, Type } from "@google/genai";
 
 // --- Constants & Types ---
 
-const GRID_W = 25;
-const GRID_H = 15;
-const CELL_SIZE = 34;
+const GRID_W = 60;
+const GRID_H = 30;
+const CELL_SIZE = 24;
 const BASE_TICK_RATE_MS = 100;
 const MOVEMENT_SPEED = 0.15;
 const DEADLOCK_THRESHOLD_TICKS = 300;
@@ -237,56 +237,24 @@ function App() {
     for (let y = 0; y < GRID_H; y++) {
       for (let x = 0; x < GRID_W; x++) {
         const id = getCellId(x, y);
-        initialGrid[id] = { x, y, type: 'empty', id };
+        initialGrid[id] = { x, y, type: 'track', id };
       }
     }
     const addStation = (x: number, y: number, name: string) => {
       const id = getCellId(x, y);
       initialGrid[id] = { ...initialGrid[id], type: 'station', stationName: name };
     };
-    const addTrack = (x: number, y: number) => {
-      const id = getCellId(x, y);
-      initialGrid[id] = { ...initialGrid[id], type: 'track' };
-    };
-
-    // 默认地图 - 更复杂的轨道网络用于测试
-    addStation(2, 7, "西站");
-    addStation(22, 7, "东站");
-    addStation(12, 2, "北站");
-    addStation(12, 12, "南站");
-    addStation(6, 4, "西北站");
-    addStation(18, 4, "东北站");
-    addStation(6, 10, "西南站");
-    addStation(18, 10, "东南站");
-
-    // 主干线
-    for(let x = 3; x < 22; x++) addTrack(x, 7);
-    for(let y = 3; y < 12; y++) if(y !== 7) addTrack(12, y);
-    addTrack(12, 7);
     
-    // 环线和分支
-    addTrack(11, 6); addTrack(11, 5); addTrack(12, 5); addTrack(13, 5); addTrack(13, 6);
-    addTrack(11, 8); addTrack(11, 9); addTrack(12, 9); addTrack(13, 9); addTrack(13, 8);
+    // 默认车站 - 适应大地图
+    addStation(5, 15, "西站");
+    addStation(55, 15, "东站");
+    addStation(30, 5, "北站");
+    addStation(30, 25, "南站");
     
-    // 西北分支
-    for(let x = 3; x <= 6; x++) addTrack(x, 4);
-    addTrack(6, 5); addTrack(6, 6);
-    
-    // 东北分支
-    for(let x = 18; x <= 21; x++) addTrack(x, 4);
-    addTrack(18, 5); addTrack(18, 6);
-    
-    // 西南分支
-    for(let x = 3; x <= 6; x++) addTrack(x, 10);
-    addTrack(6, 8); addTrack(6, 9);
-    
-    // 东南分支
-    for(let x = 18; x <= 21; x++) addTrack(x, 10);
-    addTrack(18, 8); addTrack(18, 9);
-
-    // 连接线
-    addTrack(3, 5); addTrack(3, 6); addTrack(3, 8); addTrack(3, 9);
-    addTrack(21, 5); addTrack(21, 6); addTrack(21, 8); addTrack(21, 9);
+    addStation(15, 10, "西北站");
+    addStation(45, 10, "东北站");
+    addStation(15, 20, "西南站");
+    addStation(45, 20, "东南站");
 
     setGrid(initialGrid);
   }, []);
@@ -335,6 +303,19 @@ function App() {
     setTrains([]);
     setGlobalDeadlockWarning(false);
     batchQueueRef.current = [];
+  }, []);
+
+  // 一键清除轨道
+  const clearTracks = useCallback(() => {
+    setGrid(prev => {
+      const next = { ...prev };
+      Object.values(next).forEach(cell => {
+        if (cell.type === 'track') {
+          next[cell.id] = { ...cell, type: 'empty' };
+        }
+      });
+      return next;
+    });
   }, []);
 
   // --- 优化的 A* 路径搜索 ---
@@ -1195,10 +1176,10 @@ function App() {
   return (
     <div className="flex flex-row h-full bg-slate-900 text-slate-100 font-sans select-none">
       {/* LEFT PANEL: MAP */}
-      <div className="flex-1 relative overflow-hidden flex flex-col items-center justify-center p-6 bg-slate-950">
+      <div className="flex-1 relative flex flex-col h-full bg-slate-950 overflow-hidden">
         
         {/* Header Indicators */}
-        <div className="absolute top-4 left-6 flex items-center space-x-4 bg-slate-900/80 backdrop-blur-md p-3 rounded-xl border border-slate-800 shadow-xl z-10">
+        <div className="absolute top-4 left-6 flex items-center space-x-4 bg-slate-900/80 backdrop-blur-md p-3 rounded-xl border border-slate-800 shadow-xl z-20 pointer-events-none">
           <div className="flex flex-col">
             <span className="text-xs text-slate-400 font-medium">仿真时间</span>
             <span className="text-xl font-mono text-cyan-400">{time}s</span>
@@ -1224,8 +1205,10 @@ function App() {
           )}
         </div>
 
-        <div 
-          className="relative bg-slate-900/50 shadow-2xl border border-slate-800 rounded-lg backdrop-blur-sm transition-all duration-300"
+        <div className="flex-1 overflow-auto w-full h-full p-6">
+          <div className="min-w-min min-h-min flex items-center justify-center">
+            <div 
+              className="relative bg-slate-900/50 shadow-2xl border border-slate-800 rounded-lg backdrop-blur-sm transition-all duration-300"
           style={{ width: GRID_W * CELL_SIZE, height: GRID_H * CELL_SIZE }}
           onContextMenu={(e) => e.preventDefault()}
         >
@@ -1344,8 +1327,10 @@ function App() {
             </div>
           )}
         </div>
+          </div>
+        </div>
         
-        <div className="absolute bottom-6 left-6 flex space-x-4 text-xs text-slate-500 bg-slate-900/80 p-2 rounded-lg border border-slate-800">
+        <div className="absolute bottom-6 left-6 flex space-x-4 text-xs text-slate-500 bg-slate-900/80 p-2 rounded-lg border border-slate-800 z-20 pointer-events-none">
           <div className="flex items-center space-x-1"><span className="w-3 h-3 bg-blue-500 rounded"></span><span>车站</span></div>
           <div className="flex items-center space-x-1"><span className="w-3 h-3 bg-slate-600 rounded"></span><span>轨道</span></div>
           <div className="border-l border-slate-700 pl-2">
@@ -1386,6 +1371,13 @@ function App() {
               className="px-4 py-2 bg-slate-700 hover:bg-slate-600 text-slate-200 rounded-lg font-bold shadow-lg text-sm active:scale-95"
             >
               ↺ 重置
+            </button>
+            <button 
+              onClick={clearTracks}
+              className="px-4 py-2 bg-red-900/50 hover:bg-red-800/50 text-red-200 border border-red-800 rounded-lg font-bold shadow-lg text-sm active:scale-95"
+              title="清除所有轨道(保留车站)"
+            >
+              🧹 清轨
             </button>
           </div>
           
@@ -1432,25 +1424,25 @@ function App() {
             {/* 快捷按钮 */}
             <div className="grid grid-cols-4 gap-2 mb-3">
               <button 
-                onClick={() => quickBatchDispatch(5, true)}
+                onClick={() => quickBatchDispatch(5, batchIsCyclic)}
                 className="bg-emerald-600 hover:bg-emerald-500 text-white py-2 rounded-lg text-xs font-bold shadow-lg active:scale-95"
               >
                 5辆
               </button>
               <button 
-                onClick={() => quickBatchDispatch(10, true)}
+                onClick={() => quickBatchDispatch(10, batchIsCyclic)}
                 className="bg-emerald-600 hover:bg-emerald-500 text-white py-2 rounded-lg text-xs font-bold shadow-lg active:scale-95"
               >
                 10辆
               </button>
               <button 
-                onClick={() => quickBatchDispatch(20, true)}
+                onClick={() => quickBatchDispatch(20, batchIsCyclic)}
                 className="bg-emerald-600 hover:bg-emerald-500 text-white py-2 rounded-lg text-xs font-bold shadow-lg active:scale-95"
               >
                 20辆
               </button>
               <button 
-                onClick={() => quickBatchDispatch(50, true)}
+                onClick={() => quickBatchDispatch(50, batchIsCyclic)}
                 className="bg-teal-600 hover:bg-teal-500 text-white py-2 rounded-lg text-xs font-bold shadow-lg active:scale-95"
               >
                 50辆
