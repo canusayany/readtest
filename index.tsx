@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useRef, useMemo } from "react";
+import React, { useState, useEffect, useRef, useMemo, useCallback } from "react";
 import { createRoot } from "react-dom/client";
 import { GoogleGenAI, Type } from "@google/genai";
 
@@ -7,10 +7,10 @@ import { GoogleGenAI, Type } from "@google/genai";
 const GRID_W = 25;
 const GRID_H = 15;
 const CELL_SIZE = 34;
-const TICK_RATE_MS = 100;
+const BASE_TICK_RATE_MS = 100;
 const MOVEMENT_SPEED = 0.15;
-const DEADLOCK_THRESHOLD_TICKS = 300; // 30 seconds
-const RESERVATION_LOOKAHEAD = 6; // How many cells ahead to reserve (allows following)
+const DEADLOCK_THRESHOLD_TICKS = 300;
+const RESERVATION_LOOKAHEAD = 6;
 
 type CellType = 'empty' | 'track' | 'station';
 
@@ -19,7 +19,7 @@ interface Cell {
   y: number;
   type: CellType;
   stationName?: string;
-  id: string; // "x-y"
+  id: string;
 }
 
 interface Train {
@@ -32,9 +32,9 @@ interface Train {
   progress: number;
   state: 'moving' | 'waiting' | 'arrived' | 'dwelling';
   priority: number;
-  type: 'manual' | 'schedule';
+  type: 'manual' | 'schedule' | 'batch';
   color: string;
-  waitingTime: number; // Ticks spent waiting
+  waitingTime: number;
   isCyclic: boolean;
   dwellRemaining: number;
 }
@@ -50,11 +50,11 @@ interface ScheduleItem {
 
 interface HistoryItem {
   id: string;
-  time: number; // Dispatch time
+  time: number;
   from: string;
   to: string;
   priority: number;
-  type: 'manual' | 'schedule';
+  type: 'manual' | 'schedule' | 'batch';
   isCyclic: boolean;
 }
 
@@ -67,36 +67,82 @@ const parseCellId = (id: string | undefined) => {
   return { x, y };
 };
 
-// Expanded color palette for uniqueness
+// Expanded color palette
 const TRAIN_COLORS = [
   '#ef4444', '#f97316', '#f59e0b', '#84cc16', '#10b981',
   '#06b6d4', '#3b82f6', '#8b5cf6', '#d946ef', '#f43f5e',
   '#ec4899', '#14b8a6', '#6366f1', '#a855f7', '#fbbf24',
-  '#a3e635', '#22d3ee', '#818cf8', '#c084fc', '#fb7185'
+  '#a3e635', '#22d3ee', '#818cf8', '#c084fc', '#fb7185',
+  '#34d399', '#fcd34d', '#fb923c', '#4ade80', '#2dd4bf'
 ];
 
-// --- A* Pathfinding Logic (Weighted) ---
+// --- 优化的二叉堆优先队列 ---
+class MinHeap<T extends { f: number }> {
+  private heap: T[] = [];
 
-interface Node {
-  id: string;
-  x: number;
-  y: number;
-  g: number; // Cost from start
-  h: number; // Heuristic to end
-  f: number; // Total cost (g + h)
-  parent?: Node;
+  private parent(i: number): number { return Math.floor((i - 1) / 2); }
+  private leftChild(i: number): number { return 2 * i + 1; }
+  private rightChild(i: number): number { return 2 * i + 2; }
+
+  private swap(i: number, j: number): void {
+    [this.heap[i], this.heap[j]] = [this.heap[j], this.heap[i]];
+  }
+
+  private siftUp(i: number): void {
+    while (i > 0 && this.heap[this.parent(i)].f > this.heap[i].f) {
+      this.swap(this.parent(i), i);
+      i = this.parent(i);
+    }
+  }
+
+  private siftDown(i: number): void {
+    let minIndex = i;
+    const left = this.leftChild(i);
+    const right = this.rightChild(i);
+
+    if (left < this.heap.length && this.heap[left].f < this.heap[minIndex].f) {
+      minIndex = left;
+    }
+    if (right < this.heap.length && this.heap[right].f < this.heap[minIndex].f) {
+      minIndex = right;
+    }
+
+    if (i !== minIndex) {
+      this.swap(i, minIndex);
+      this.siftDown(minIndex);
+    }
+  }
+
+  push(item: T): void {
+    this.heap.push(item);
+    this.siftUp(this.heap.length - 1);
+  }
+
+  pop(): T | undefined {
+    if (this.heap.length === 0) return undefined;
+    if (this.heap.length === 1) return this.heap.pop();
+    
+    const result = this.heap[0];
+    this.heap[0] = this.heap.pop()!;
+    this.siftDown(0);
+    return result;
+  }
+
+  isEmpty(): boolean {
+    return this.heap.length === 0;
+  }
+
+  size(): number {
+    return this.heap.length;
+  }
 }
 
-const getHeuristic = (x1: number, y1: number, x2: number, y2: number) => {
-  // Manhattan distance is usually best for grid
-  return Math.abs(x1 - x2) + Math.abs(y1 - y2);
-};
-
-class PriorityQueue<T extends { f: number }> {
+// --- 旧版优先队列 (用于性能对比) ---
+class PriorityQueueLegacy<T extends { f: number }> {
   private items: T[] = [];
   push(item: T) {
     this.items.push(item);
-    this.items.sort((a, b) => a.f - b.f);
+    this.items.sort((a, b) => a.f - b.f); // 性能瓶颈：每次插入都排序 O(N log N)
   }
   pop(): T | undefined {
     return this.items.shift();
@@ -105,6 +151,22 @@ class PriorityQueue<T extends { f: number }> {
     return this.items.length === 0;
   }
 }
+
+// --- A* Node ---
+interface AStarNode {
+  id: string;
+  x: number;
+  y: number;
+  g: number;
+  h: number;
+  f: number;
+  parent?: AStarNode;
+}
+
+const getHeuristic = (x1: number, y1: number, x2: number, y2: number): number => {
+  // 曼哈顿距离 + 微小的对角线惩罚
+  return Math.abs(x1 - x2) + Math.abs(y1 - y2);
+};
 
 // --- Component ---
 
@@ -134,12 +196,29 @@ function App() {
   const [hoveredTrainId, setHoveredTrainId] = useState<string | null>(null);
   const [previewPath, setPreviewPath] = useState<string[]>([]);
   const [globalDeadlockWarning, setGlobalDeadlockWarning] = useState(false);
+  
+  // 新增：速度控制
+  const [simulationSpeed, setSimulationSpeed] = useState(1);
+  
+  // 新增：批量发车设置
+  const [batchCount, setBatchCount] = useState(10);
+  const [batchIsCyclic, setBatchIsCyclic] = useState(true);
+  const [batchDelay, setBatchDelay] = useState(5); // 每隔多少tick发一辆
+
+  // 性能测试结果状态
+  const [benchmarkResult, setBenchmarkResult] = useState<{
+    legacyTime: number;
+    newTime: number;
+    iterations: number;
+    improvement: string;
+  } | null>(null);
+  const [isBenchmarking, setIsBenchmarking] = useState(false);
 
   // Refs
   const gridRef = useRef(grid);
   const trainsRef = useRef(trains);
   const scheduleRef = useRef(schedule);
-  const timeRef = useRef(time); // Use ref for stable loop access
+  const timeRef = useRef(time);
   
   gridRef.current = grid;
   trainsRef.current = trains;
@@ -148,6 +227,9 @@ function App() {
 
   const isMouseDown = useRef(false);
   const dragAction = useRef<'track' | 'erase' | null>(null);
+  
+  // 批量发车队列
+  const batchQueueRef = useRef<{from: string, to: string, dispatchAt: number, priority: number, isCyclic: boolean}[]>([]);
 
   // Initialize Grid
   useEffect(() => {
@@ -167,19 +249,44 @@ function App() {
       initialGrid[id] = { ...initialGrid[id], type: 'track' };
     };
 
-    // Default map
+    // 默认地图 - 更复杂的轨道网络用于测试
     addStation(2, 7, "西站");
     addStation(22, 7, "东站");
     addStation(12, 2, "北站");
     addStation(12, 12, "南站");
+    addStation(6, 4, "西北站");
+    addStation(18, 4, "东北站");
+    addStation(6, 10, "西南站");
+    addStation(18, 10, "东南站");
 
-    for(let x=3; x<22; x++) addTrack(x, 7);
-    for(let y=3; y<12; y++) if(y !== 7) addTrack(12, y);
-    addTrack(12, 7); 
+    // 主干线
+    for(let x = 3; x < 22; x++) addTrack(x, 7);
+    for(let y = 3; y < 12; y++) if(y !== 7) addTrack(12, y);
+    addTrack(12, 7);
     
-    // Loops
+    // 环线和分支
     addTrack(11, 6); addTrack(11, 5); addTrack(12, 5); addTrack(13, 5); addTrack(13, 6);
     addTrack(11, 8); addTrack(11, 9); addTrack(12, 9); addTrack(13, 9); addTrack(13, 8);
+    
+    // 西北分支
+    for(let x = 3; x <= 6; x++) addTrack(x, 4);
+    addTrack(6, 5); addTrack(6, 6);
+    
+    // 东北分支
+    for(let x = 18; x <= 21; x++) addTrack(x, 4);
+    addTrack(18, 5); addTrack(18, 6);
+    
+    // 西南分支
+    for(let x = 3; x <= 6; x++) addTrack(x, 10);
+    addTrack(6, 8); addTrack(6, 9);
+    
+    // 东南分支
+    for(let x = 18; x <= 21; x++) addTrack(x, 10);
+    addTrack(18, 8); addTrack(18, 9);
+
+    // 连接线
+    addTrack(3, 5); addTrack(3, 6); addTrack(3, 8); addTrack(3, 9);
+    addTrack(21, 5); addTrack(21, 6); addTrack(21, 8); addTrack(21, 9);
 
     setGrid(initialGrid);
   }, []);
@@ -201,16 +308,16 @@ function App() {
 
   // --- Helpers ---
 
-  const getUniqueColor = (currentTrains: Train[]) => {
+  const getUniqueColor = useCallback((currentTrains: Train[]) => {
     const usedColors = new Set(currentTrains.map(t => t.color));
     const available = TRAIN_COLORS.filter(c => !usedColors.has(c));
     if (available.length > 0) {
       return available[Math.floor(Math.random() * available.length)];
     }
     return TRAIN_COLORS[Math.floor(Math.random() * TRAIN_COLORS.length)];
-  };
+  }, []);
 
-  const resetSystem = () => {
+  const resetSystem = useCallback(() => {
     setIsRunning(false);
     setTime(0);
     setTrains([]);
@@ -220,18 +327,25 @@ function App() {
     setDispatchFrom("");
     setDispatchTo("");
     setDispatchIsCyclic(false);
-  };
+    batchQueueRef.current = [];
+  }, []);
 
-  // --- A* Pathfinding Logic (Weighted) ---
+  // 清除所有运行中的车辆
+  const clearAllTrains = useCallback(() => {
+    setTrains([]);
+    setGlobalDeadlockWarning(false);
+    batchQueueRef.current = [];
+  }, []);
 
-  const findPathAStar = (
+  // --- 优化的 A* 路径搜索 ---
+  const findPathAStar = useCallback((
     startId: string, 
     endId: string, 
     currentGrid: Record<string, Cell>,
     currentTrains: Train[] = [], 
     ignoreTrainId?: string,
     reservedCells?: Set<string>,
-    strictMode: boolean = false // If true, treats reserved cells as WALLS
+    strictMode: boolean = false
   ): string[] | null => {
     
     if (!currentGrid[startId] || !currentGrid[endId]) return null;
@@ -241,24 +355,23 @@ function App() {
 
     currentTrains.forEach(t => {
       if (t.id === ignoreTrainId) return;
-      // Consider all cells in the train's CURRENT planned path as "soft" obstacles
-      // But specifically, where the train IS currently is a "hard" obstacle for movement
       const tPos = t.path[t.currentPathIndex];
-      if (!tPos) return; // Guard against undefined path index
+      if (!tPos) return;
 
       occupiedCells.add(tPos);
       
       const pos = parseCellId(tPos);
       const neighbors = [[0,1], [0,-1], [1,0], [-1,0]];
       neighbors.forEach(([dx, dy]) => {
-         nearCongestionCells.add(getCellId(pos.x + dx, pos.y + dy));
+        nearCongestionCells.add(getCellId(pos.x + dx, pos.y + dy));
       });
     });
 
     const startNode = parseCellId(startId);
     const endNode = parseCellId(endId);
 
-    const openSet = new PriorityQueue<Node>();
+    // 使用优化的二叉堆
+    const openSet = new MinHeap<AStarNode>();
     const startH = getHeuristic(startNode.x, startNode.y, endNode.x, endNode.y);
     openSet.push({ 
       id: startId, 
@@ -272,14 +385,121 @@ function App() {
     const visited = new Map<string, number>();
     visited.set(startId, 0);
 
-    const cameFrom = new Map<string, Node>();
-
     while (!openSet.isEmpty()) {
       const current = openSet.pop()!;
 
       if (current.id === endId) {
         const path: string[] = [];
-        let curr: Node | undefined = current;
+        let curr: AStarNode | undefined = current;
+        while (curr) {
+          path.unshift(curr.id);
+          curr = curr.parent;
+        }
+        return path;
+      }
+
+      // 如果当前节点的g值比已记录的大,跳过(已有更优路径)
+      if (visited.has(current.id) && visited.get(current.id)! < current.g) {
+        continue;
+      }
+
+      const neighbors = [
+        { nx: current.x, ny: current.y - 1 },
+        { nx: current.x, ny: current.y + 1 },
+        { nx: current.x - 1, ny: current.y },
+        { nx: current.x + 1, ny: current.y }
+      ];
+
+      for (const { nx, ny } of neighbors) {
+        const nid = getCellId(nx, ny);
+        const neighborCell = currentGrid[nid];
+
+        if (neighborCell && (neighborCell.type === 'track' || neighborCell.type === 'station')) {
+          let moveCost = 1;
+          
+          if (strictMode && reservedCells && reservedCells.has(nid) && nid !== endId) {
+            continue;
+          }
+
+          // 动态权重策略
+          if (occupiedCells.has(nid) && nid !== endId) {
+            moveCost += 20; 
+          }
+
+          if (!strictMode && reservedCells && reservedCells.has(nid) && nid !== endId) {
+            moveCost += 1000;
+          }
+
+          if (nearCongestionCells.has(nid)) {
+            moveCost += 2;
+          }
+
+          // 转向惩罚
+          if (current.parent) {
+            const dx = nx - current.x;
+            const dy = ny - current.y;
+            const pdx = current.x - current.parent.x;
+            const pdy = current.y - current.parent.y;
+            if (dx !== pdx || dy !== pdy) {
+              moveCost += 0.5;
+            }
+          }
+
+          const newG = current.g + moveCost;
+          
+          if (!visited.has(nid) || newG < visited.get(nid)!) {
+            visited.set(nid, newG);
+            const h = getHeuristic(nx, ny, endNode.x, endNode.y);
+            
+            const neighborNode: AStarNode = {
+              id: nid,
+              x: nx,
+              y: ny,
+              g: newG,
+              h: h,
+              f: newG + h,
+              parent: current
+            };
+            openSet.push(neighborNode);
+          }
+        }
+      }
+    }
+    return null;
+  }, []);
+
+  // --- 旧版 A* 算法 (用于性能对比) ---
+  const findPathAStarLegacy = useCallback((
+    startId: string, 
+    endId: string, 
+    currentGrid: Record<string, Cell>,
+    currentTrains: Train[] = []
+  ): string[] | null => {
+    if (!currentGrid[startId] || !currentGrid[endId]) return null;
+
+    // 简化环境检查，仅用于纯算法性能对比
+    const startNode = parseCellId(startId);
+    const endNode = parseCellId(endId);
+
+    const openSet = new PriorityQueueLegacy<AStarNode>(); // 使用旧队列
+    const startH = getHeuristic(startNode.x, startNode.y, endNode.x, endNode.y);
+    openSet.push({ 
+      id: startId, 
+      x: startNode.x, 
+      y: startNode.y, 
+      g: 0, 
+      h: startH, 
+      f: startH 
+    });
+
+    const visited = new Map<string, number>();
+    visited.set(startId, 0);
+
+    while (!openSet.isEmpty()) {
+      const current = openSet.pop()!;
+      if (current.id === endId) {
+        const path: string[] = [];
+        let curr: AStarNode | undefined = current;
         while (curr) {
           path.unshift(curr.id);
           curr = curr.parent;
@@ -299,84 +519,105 @@ function App() {
         const neighborCell = currentGrid[nid];
 
         if (neighborCell && (neighborCell.type === 'track' || neighborCell.type === 'station')) {
-          let moveCost = 1;
-          
-          // STRICT MODE: Treat reserved cells as walls (unless it's the destination)
-          if (strictMode && reservedCells && reservedCells.has(nid) && nid !== endId) {
-             continue; // Unwalkable
-          }
-
-          // --- Dynamic Weighting Strategy ---
-          
-          // 1. Occupied by a train physically: Moderate penalty
-          if (occupiedCells.has(nid) && nid !== endId) {
-             moveCost += 20; 
-          }
-
-          // 2. Reserved by another train's critical path: High cost
-          // If NOT strict mode, we allow passing through reservations with high cost (waiting behavior)
-          if (!strictMode && reservedCells && reservedCells.has(nid) && nid !== endId) {
-            moveCost += 1000;
-          }
-
-          // 3. Near other trains: Slight penalty (prefer space)
-          if (nearCongestionCells.has(nid)) {
-            moveCost += 2;
-          }
-
-          // 4. Turn Penalty: Prefer straight lines
-          if (current.parent) {
-             const dx = nx - current.x;
-             const dy = ny - current.y;
-             const pdx = current.x - current.parent.x;
-             const pdy = current.y - current.parent.y;
-             if (dx !== pdx || dy !== pdy) {
-                 moveCost += 0.5;
-             }
-          }
-
-          const newG = current.g + moveCost;
-          
+          const newG = current.g + 1;
           if (!visited.has(nid) || newG < visited.get(nid)!) {
             visited.set(nid, newG);
             const h = getHeuristic(nx, ny, endNode.x, endNode.y);
-            
-            const neighborNode: Node = {
-              id: nid,
-              x: nx,
-              y: ny,
-              g: newG,
-              h: h,
-              f: newG + h,
-              parent: current
-            };
-            openSet.push(neighborNode);
+            openSet.push({
+              id: nid, x: nx, y: ny, g: newG, h: h, f: newG + h, parent: current
+            });
           }
         }
       }
     }
     return null;
-  };
+  }, []);
 
-  const isPathClear = (
+  // --- 性能测试函数 ---
+  const runAlgorithmBenchmark = useCallback(() => {
+    setIsBenchmarking(true);
+    setTimeout(() => {
+      const iterations = 100; // 次数减少，但单次计算量增大
+      
+      // --- 构造一个虚拟的大规模测试环境 (100x100) ---
+      // 这能模拟真实大地图场景，凸显算法差异
+      const BENCH_W = 100;
+      const BENCH_H = 100;
+      const benchGrid: Record<string, Cell> = {};
+      
+      // 初始化网格
+      for(let y=0; y<BENCH_H; y++) {
+        for(let x=0; x<BENCH_W; x++) {
+          const id = `${x}-${y}`;
+          benchGrid[id] = { x, y, type: 'track', id };
+        }
+      }
+      
+      // 添加随机障碍物 (模拟复杂地形，强制A*搜索更多节点)
+      for(let i=0; i<2000; i++) {
+        const x = Math.floor(Math.random() * BENCH_W);
+        const y = Math.floor(Math.random() * BENCH_H);
+        const id = `${x}-${y}`;
+        if (benchGrid[id]) benchGrid[id].type = 'empty'; // 设为不可通行
+      }
+
+      // 生成起终点
+      const testCases: {fromId: string, toId: string}[] = [];
+      for(let i=0; i<iterations; i++) {
+        // 确保起终点距离较远
+        const x1 = Math.floor(Math.random() * (BENCH_W/3));
+        const y1 = Math.floor(Math.random() * BENCH_H);
+        const x2 = Math.floor(BENCH_W - 1 - Math.random() * (BENCH_W/3));
+        const y2 = Math.floor(Math.random() * BENCH_H);
+        
+        testCases.push({ fromId: `${x1}-${y1}`, toId: `${x2}-${y2}` });
+      }
+
+      // 2. 测试旧算法
+      const startLegacy = performance.now();
+      for(const {fromId, toId} of testCases) {
+        findPathAStarLegacy(fromId, toId, benchGrid, []);
+      }
+      const endLegacy = performance.now();
+      const legacyTime = endLegacy - startLegacy;
+
+      // 3. 测试新算法
+      const startNew = performance.now();
+      for(const {fromId, toId} of testCases) {
+        findPathAStar(fromId, toId, benchGrid, []);
+      }
+      const endNew = performance.now();
+      const newTime = endNew - startNew;
+
+      // 4. 计算结果
+      const improvement = legacyTime > 0 ? ((legacyTime - newTime) / legacyTime * 100).toFixed(1) : "0.0";
+      const speedup = newTime > 0 ? (legacyTime / newTime).toFixed(1) : "1.0";
+
+      setBenchmarkResult({
+        legacyTime,
+        newTime,
+        iterations,
+        improvement: `${improvement}% (快 ${speedup}x)`
+      });
+      setIsBenchmarking(false);
+    }, 100);
+  }, [findPathAStar, findPathAStarLegacy]);
+
+  const isPathClear = useCallback((
     pathSegment: string[], 
     myTrainId: string, 
     allTrains: Train[],
     reservedCells: Set<string>
   ): boolean => {
     for (const cellId of pathSegment) {
-      // Check Reservations
       if (reservedCells.has(cellId)) return false;
 
-      // Check Physical Presence
       const occupier = allTrains.find(t => {
         if (t.id === myTrainId) return false;
         const tPos = t.path[t.currentPathIndex];
         
-        // Occupied if train is AT cell
         if (tPos === cellId) return true;
         
-        // OR moving INTO cell (next step)
         if (t.state === 'moving' && t.currentPathIndex + 1 < t.path.length) {
           if (t.path[t.currentPathIndex + 1] === cellId) return true;
         }
@@ -386,9 +627,15 @@ function App() {
       if (occupier) return false;
     }
     return true;
-  };
+  }, []);
 
-  const dispatchTrain = (fromName: string, toName: string, priority: number, isManual: boolean, isCyclic: boolean = false) => {
+  const dispatchTrain = useCallback((
+    fromName: string, 
+    toName: string, 
+    priority: number, 
+    dispatchType: 'manual' | 'schedule' | 'batch',
+    isCyclic: boolean = false
+  ) => {
     if (fromName === toName) return; 
 
     const stationsList = (Object.values(gridRef.current) as Cell[]).filter(c => c.type === 'station');
@@ -398,10 +645,11 @@ function App() {
     if (from && to) {
       const path = findPathAStar(from.id, to.id, gridRef.current, trainsRef.current);
       if (path) {
-        const trainId = `${isManual ? 'man' : 'sch'}-${Date.now()}-${Math.random().toString(36).substr(2, 4)}`;
+        const trainId = `${dispatchType.slice(0,3)}-${Date.now()}-${Math.random().toString(36).substr(2, 4)}`;
+        const typePrefix = dispatchType === 'manual' ? '临' : (dispatchType === 'batch' ? '批' : 'T');
         const newTrain: Train = {
           id: trainId,
-          name: `${isManual ? '临' : 'T'}-${trainId.slice(-4)}`,
+          name: `${typePrefix}-${trainId.slice(-4)}`,
           fromId: from.id,
           toId: to.id,
           path,
@@ -409,7 +657,7 @@ function App() {
           progress: 0,
           state: 'waiting',
           priority: priority,
-          type: isManual ? 'manual' : 'schedule',
+          type: dispatchType,
           color: getUniqueColor(trainsRef.current),
           waitingTime: 0,
           isCyclic: isCyclic,
@@ -423,15 +671,79 @@ function App() {
           from: fromName,
           to: toName,
           priority: priority,
-          type: isManual ? 'manual' : 'schedule',
+          type: dispatchType,
           isCyclic: isCyclic
         }, ...prev]);
 
-      } else {
-        if (isManual) alert(`无法规划路径：可能所有轨道已断开。`);
       }
     }
-  };
+  }, [findPathAStar, getUniqueColor]);
+
+  // --- 一键批量发车功能 ---
+  const batchDispatchTrains = useCallback(() => {
+    const stationsList = (Object.values(gridRef.current) as Cell[]).filter(c => c.type === 'station');
+    if (stationsList.length < 2) {
+      alert("至少需要2个车站才能发车！");
+      return;
+    }
+
+    const stationNames = stationsList.map(s => s.stationName!);
+    const queue: {from: string, to: string, dispatchAt: number, priority: number, isCyclic: boolean}[] = [];
+    
+    for (let i = 0; i < batchCount; i++) {
+      // 随机选择起终点
+      const fromIdx = Math.floor(Math.random() * stationNames.length);
+      let toIdx = Math.floor(Math.random() * stationNames.length);
+      while (toIdx === fromIdx) {
+        toIdx = Math.floor(Math.random() * stationNames.length);
+      }
+      
+      queue.push({
+        from: stationNames[fromIdx],
+        to: stationNames[toIdx],
+        dispatchAt: timeRef.current + i * batchDelay,
+        priority: Math.floor(Math.random() * 10) + 1,
+        isCyclic: batchIsCyclic
+      });
+    }
+    
+    batchQueueRef.current = queue;
+    
+    // 如果仿真没有运行，自动启动
+    if (!isRunning) {
+      setIsRunning(true);
+    }
+  }, [batchCount, batchDelay, batchIsCyclic, isRunning]);
+
+  // 快速测试：随机发送指定数量的车辆（立即发车）
+  const quickBatchDispatch = useCallback((count: number, cyclic: boolean = true) => {
+    const stationsList = (Object.values(gridRef.current) as Cell[]).filter(c => c.type === 'station');
+    if (stationsList.length < 2) return;
+
+    const stationNames = stationsList.map(s => s.stationName!);
+    
+    for (let i = 0; i < count; i++) {
+      const fromIdx = Math.floor(Math.random() * stationNames.length);
+      let toIdx = Math.floor(Math.random() * stationNames.length);
+      while (toIdx === fromIdx) {
+        toIdx = Math.floor(Math.random() * stationNames.length);
+      }
+      
+      setTimeout(() => {
+        dispatchTrain(
+          stationNames[fromIdx], 
+          stationNames[toIdx], 
+          Math.floor(Math.random() * 10) + 1, 
+          'batch',
+          cyclic
+        );
+      }, i * 100); // 间隔100ms发车，避免同时创建太多
+    }
+    
+    if (!isRunning) {
+      setIsRunning(true);
+    }
+  }, [dispatchTrain, isRunning]);
 
   // --- AI ---
   const generateScheduleWithAI = async () => {
@@ -505,14 +817,27 @@ function App() {
   useEffect(() => {
     if (!isRunning) return;
 
+    const actualTickRate = Math.max(20, BASE_TICK_RATE_MS / simulationSpeed);
+
     const tick = setInterval(() => {
       const currentTime = timeRef.current + 1;
       setTime(currentTime);
       
+      // 处理批量发车队列
+      const batchQueue = batchQueueRef.current;
+      const toDispatch = batchQueue.filter(item => item.dispatchAt <= currentTime);
+      if (toDispatch.length > 0) {
+        toDispatch.forEach(item => {
+          dispatchTrain(item.from, item.to, item.priority, 'batch', item.isCyclic);
+        });
+        batchQueueRef.current = batchQueue.filter(item => item.dispatchAt > currentTime);
+      }
+      
+      // 处理计划发车
       const currentSched = scheduleRef.current;
       const updatedSched = currentSched.map(item => {
         if (!item.dispatched && item.time <= currentTime) {
-          dispatchTrain(item.from, item.to, item.priority, false);
+          dispatchTrain(item.from, item.to, item.priority, 'schedule');
           return { ...item, dispatched: true };
         }
         return item;
@@ -522,70 +847,66 @@ function App() {
         setSchedule(updatedSched);
       }
 
-      // Process Trains
+      // 处理列车
       let activeTrains = [...trainsRef.current];
       const globalReservations = new Set<string>();
       
-      // Sort by priority (Higher first)
       activeTrains.sort((a, b) => b.priority - a.priority);
 
       const nextTrainsState = activeTrains.map(train => {
         let { currentPathIndex, progress, state, path, waitingTime, dwellRemaining } = train;
         
-        // --- DWELLING (Cyclic) ---
+        // --- DWELLING ---
         if (state === 'dwelling') {
-           if (dwellRemaining > 0) {
-              return { ...train, dwellRemaining: dwellRemaining - 1 };
-           }
-           const newFrom = train.toId;
-           const newTo = train.fromId;
-           
-           // When dwelling finishes, finding path
-           const returnPath = findPathAStar(
-              newFrom, 
-              newTo, 
-              gridRef.current, 
-              trainsRef.current, 
-              train.id
-           );
-           
-           if (returnPath && returnPath.length > 0) {
-              return {
-                 ...train,
-                 fromId: newFrom,
-                 toId: newTo,
-                 path: returnPath,
-                 currentPathIndex: 0,
-                 progress: 0,
-                 state: 'waiting',
-                 waitingTime: 0,
-                 dwellRemaining: 0
-              };
-           } else {
-              return { ...train, dwellRemaining: 10 };
-           }
+          if (dwellRemaining > 0) {
+            return { ...train, dwellRemaining: dwellRemaining - 1 };
+          }
+          const newFrom = train.toId;
+          const newTo = train.fromId;
+          
+          const returnPath = findPathAStar(
+            newFrom, 
+            newTo, 
+            gridRef.current, 
+            trainsRef.current, 
+            train.id
+          );
+          
+          if (returnPath && returnPath.length > 0) {
+            return {
+              ...train,
+              fromId: newFrom,
+              toId: newTo,
+              path: returnPath,
+              currentPathIndex: 0,
+              progress: 0,
+              state: 'waiting' as const,
+              waitingTime: 0,
+              dwellRemaining: 0
+            };
+          } else {
+            return { ...train, dwellRemaining: 10 };
+          }
         }
 
         // --- ARRIVED ---
         if (state === 'arrived') {
-           if (train.isCyclic) {
-              return { ...train, state: 'dwelling', dwellRemaining: 30 };
-           }
-           return train; 
+          if (train.isCyclic) {
+            return { ...train, state: 'dwelling' as const, dwellRemaining: 30 };
+          }
+          return train; 
         }
 
-        // Safety check
         if (!path || !path[currentPathIndex]) {
-           // Invalid path state, potentially arrived or error
-           return { ...train, state: 'arrived' };
+          return { ...train, state: 'arrived' as const };
         }
 
         const currentCellId = path[currentPathIndex];
         
-        // --- MOVING -> WAITING TRANSITION ---
+        // --- MOVING -> WAITING ---
         if (state === 'moving') {
           waitingTime = 0;
-          progress += MOVEMENT_SPEED;
+          progress += MOVEMENT_SPEED * simulationSpeed;
           if (progress >= 1.0) {
             progress = 0;
             currentPathIndex++;
@@ -593,79 +914,65 @@ function App() {
           }
         }
 
-        // --- WAITING / PLANNING NEXT MOVE ---
+        // --- WAITING ---
         if (state === 'waiting') {
-           if (currentPathIndex >= path.length - 1) {
-             return { ...train, state: 'arrived', progress: 0, currentPathIndex, waitingTime: 0 };
-           }
+          if (currentPathIndex >= path.length - 1) {
+            return { ...train, state: 'arrived' as const, progress: 0, currentPathIndex, waitingTime: 0 };
+          }
 
-           const isAtStation = gridRef.current[path[currentPathIndex]]?.type === 'station';
+          const segmentEndIdx = Math.min(path.length, currentPathIndex + RESERVATION_LOOKAHEAD);
+          let segmentToReserve = path.slice(currentPathIndex + 1, segmentEndIdx);
+          
+          const blocked = !isPathClear(segmentToReserve, train.id, trainsRef.current, globalReservations);
 
-           // Sliding Window Reservation: Reserve up to N steps ahead OR until next station
-           // This allows "Following" behavior.
-           const segmentEndIdx = Math.min(path.length, currentPathIndex + RESERVATION_LOOKAHEAD);
-           let segmentToReserve = path.slice(currentPathIndex + 1, segmentEndIdx);
-           
-           const blocked = !isPathClear(segmentToReserve, train.id, trainsRef.current, globalReservations);
+          if (blocked) {
+            const strictReroutePath = findPathAStar(
+              path[currentPathIndex], 
+              train.toId, 
+              gridRef.current, 
+              trainsRef.current,
+              train.id,
+              globalReservations,
+              true
+            );
 
-           if (blocked) {
-              // Reroute Attempt: Try to find a STRICTLY FREE path
-              // This is critical for bypasses. We force A* to treat reserved cells as walls.
-              const strictReroutePath = findPathAStar(
-                path[currentPathIndex], 
-                train.toId, 
-                gridRef.current, 
-                trainsRef.current,
-                train.id,
-                globalReservations,
-                true // STRICT MODE
-              );
-
-              if (strictReroutePath && strictReroutePath.length > 0) {
-                 // Found a guaranteed free path, switch immediately
-                 // IMPORTANT: Use slice(0, currentPathIndex + 1) to KEEP current position!
-                 path = [...path.slice(0, currentPathIndex + 1), ...strictReroutePath.slice(1)];
-                 
-                 // Re-calc reservation segment based on new path
-                 const newSegmentEndIdx = Math.min(path.length, currentPathIndex + RESERVATION_LOOKAHEAD);
-                 segmentToReserve = path.slice(currentPathIndex + 1, newSegmentEndIdx);
-              } 
-              else {
-                 // If no strict path, try a standard weighted reroute (maybe wait on a shorter blocked path?)
-                 // Only do this periodically to save CPU, or if waiting a long time
-                 if (waitingTime % 10 === 0) {
-                    const softReroutePath = findPathAStar(
-                        path[currentPathIndex], 
-                        train.toId, 
-                        gridRef.current, 
-                        trainsRef.current,
-                        train.id,
-                        globalReservations,
-                        false // Soft mode
-                    );
-                    if (softReroutePath && softReroutePath.length > 0) {
-                        path = [...path.slice(0, currentPathIndex + 1), ...softReroutePath.slice(1)];
-                    }
-                 }
+            if (strictReroutePath && strictReroutePath.length > 0) {
+              path = [...path.slice(0, currentPathIndex + 1), ...strictReroutePath.slice(1)];
+              
+              const newSegmentEndIdx = Math.min(path.length, currentPathIndex + RESERVATION_LOOKAHEAD);
+              segmentToReserve = path.slice(currentPathIndex + 1, newSegmentEndIdx);
+            } 
+            else {
+              if (waitingTime % 10 === 0) {
+                const softReroutePath = findPathAStar(
+                  path[currentPathIndex], 
+                  train.toId, 
+                  gridRef.current, 
+                  trainsRef.current,
+                  train.id,
+                  globalReservations,
+                  false
+                );
+                if (softReroutePath && softReroutePath.length > 0) {
+                  path = [...path.slice(0, currentPathIndex + 1), ...softReroutePath.slice(1)];
+                }
               }
-           }
+            }
+          }
 
-           // Check if clear (after potential reroute)
-           if (isPathClear(segmentToReserve, train.id, trainsRef.current, globalReservations)) {
-             segmentToReserve.forEach(cid => globalReservations.add(cid));
-             state = 'moving';
-             waitingTime = 0;
-           } else {
-             // Blocked: Reserve current spot to prevent others from running into us
-             globalReservations.add(currentCellId);
-             waitingTime++;
-           }
+          if (isPathClear(segmentToReserve, train.id, trainsRef.current, globalReservations)) {
+            segmentToReserve.forEach(cid => globalReservations.add(cid));
+            state = 'moving';
+            waitingTime = 0;
+          } else {
+            globalReservations.add(currentCellId);
+            waitingTime++;
+          }
         } 
         else if (state === 'moving') {
-           // Maintain reservation for moving trains (Lookahead)
-           const segmentEndIdx = Math.min(path.length, currentPathIndex + RESERVATION_LOOKAHEAD);
-           const segmentToKeep = path.slice(currentPathIndex + 1, segmentEndIdx);
-           segmentToKeep.forEach(cid => globalReservations.add(cid));
+          const segmentEndIdx = Math.min(path.length, currentPathIndex + RESERVATION_LOOKAHEAD);
+          const segmentToKeep = path.slice(currentPathIndex + 1, segmentEndIdx);
+          segmentToKeep.forEach(cid => globalReservations.add(cid));
         }
 
         return { ...train, currentPathIndex, progress, state, path, waitingTime };
@@ -674,20 +981,20 @@ function App() {
       const runningTrains = nextTrainsState.filter(t => t.state !== 'arrived' || t.isCyclic);
       
       if (runningTrains.length > 1 && runningTrains.every(t => t.state === 'waiting' && t.waitingTime > 20)) {
-         setGlobalDeadlockWarning(true);
+        setGlobalDeadlockWarning(true);
       } else {
-         setGlobalDeadlockWarning(false);
+        setGlobalDeadlockWarning(false);
       }
 
       setTrains(runningTrains);
 
-    }, TICK_RATE_MS);
+    }, actualTickRate);
 
     return () => clearInterval(tick);
-  }, [isRunning]); 
+  }, [isRunning, simulationSpeed, findPathAStar, isPathClear, dispatchTrain]); 
 
 
-  // --- Event Handlers (Editor) ---
+  // --- Event Handlers ---
 
   const modifyCell = (x: number, y: number, action: 'track' | 'station' | 'erase') => {
     setGrid(prev => {
@@ -745,8 +1052,8 @@ function App() {
       const newName = prompt("重命名车站:", cell.stationName);
       if (newName && newName.trim() !== "") {
         setGrid(prev => ({
-           ...prev,
-           [id]: { ...cell, stationName: newName.trim() }
+          ...prev,
+          [id]: { ...cell, stationName: newName.trim() }
         }));
       }
     }
@@ -754,6 +1061,7 @@ function App() {
 
   // Preview logic
   const stations = useMemo(() => (Object.values(grid) as Cell[]).filter(c => c.type === 'station'), [grid]);
+  
   useEffect(() => {
     if (!dispatchFrom || !dispatchTo || dispatchFrom === dispatchTo) {
       setPreviewPath([]);
@@ -767,10 +1075,10 @@ function App() {
     } else {
       setPreviewPath([]);
     }
-  }, [dispatchFrom, dispatchTo, grid, stations, trains]);
+  }, [dispatchFrom, dispatchTo, grid, stations, trains, findPathAStar]);
 
   const handleManualDispatch = () => {
-    dispatchTrain(dispatchFrom, dispatchTo, dispatchPriority, true, dispatchIsCyclic);
+    dispatchTrain(dispatchFrom, dispatchTo, dispatchPriority, 'manual', dispatchIsCyclic);
   };
 
   // --- Render Helpers ---
@@ -804,10 +1112,8 @@ function App() {
     return lines;
   }, [grid]);
 
-  // Visualize path for ALL active trains
   const activeTrainPaths = useMemo(() => {
     return trains.map(t => {
-      // Draw from current position to end
       if (!t.path || t.path.length === 0) return null;
       const remainingPath = t.path.slice(Math.max(0, t.currentPathIndex));
       if (remainingPath.length < 2) return null;
@@ -825,7 +1131,7 @@ function App() {
           stroke={t.color}
           strokeWidth="6"
           strokeLinecap="round"
-          strokeOpacity="0.15" // Subtle path indication
+          strokeOpacity="0.15"
         />
       );
     });
@@ -856,7 +1162,6 @@ function App() {
     const train = trains.find(t => t.id === hoveredTrainId);
     if (!train) return null;
     
-    // Guard against undefined path
     if (!train.path || !train.path[train.currentPathIndex]) return null;
 
     const currentPos = parseCellId(train.path[train.currentPathIndex]);
@@ -871,17 +1176,14 @@ function App() {
   }, [hoveredTrainId, trains, stations]);
 
   const pendingTrains = schedule.filter(s => !s.dispatched);
+  const pendingBatchCount = batchQueueRef.current.length;
   
-  // Deduplicate and Filter history
   const uniqueHistory = useMemo(() => {
     const seen = new Set<string>();
-    // History is newest first. We want to show unique routes, keeping the parameters of the most recent dispatch.
     return history.filter(item => {
-      // 1. Apply Text Filters
       if (historyFilterFrom && item.from !== historyFilterFrom) return false;
       if (historyFilterTo && item.to !== historyFilterTo) return false;
 
-      // 2. Apply Deduplication (Route based)
       const key = `${item.from}->${item.to}`;
       if (seen.has(key)) return false;
       
@@ -897,24 +1199,29 @@ function App() {
         
         {/* Header Indicators */}
         <div className="absolute top-4 left-6 flex items-center space-x-4 bg-slate-900/80 backdrop-blur-md p-3 rounded-xl border border-slate-800 shadow-xl z-10">
-           <div className="flex flex-col">
-             <span className="text-xs text-slate-400 font-medium">仿真时间</span>
-             <span className="text-xl font-mono text-cyan-400">{time}s</span>
-           </div>
-           <div className="h-8 w-px bg-slate-700"></div>
-           <div className="flex flex-col">
-             <span className="text-xs text-slate-400 font-medium">在途列车</span>
-             <span className="text-xl font-mono text-emerald-400">{trains.length}</span>
-           </div>
-           {globalDeadlockWarning && (
-             <>
-               <div className="h-8 w-px bg-slate-700"></div>
-               <div className="flex items-center space-x-2 text-rose-500 animate-pulse font-bold">
-                 <span className="text-2xl">⚠</span>
-                 <span>系统拥堵警告</span>
-               </div>
-             </>
-           )}
+          <div className="flex flex-col">
+            <span className="text-xs text-slate-400 font-medium">仿真时间</span>
+            <span className="text-xl font-mono text-cyan-400">{time}s</span>
+          </div>
+          <div className="h-8 w-px bg-slate-700"></div>
+          <div className="flex flex-col">
+            <span className="text-xs text-slate-400 font-medium">在途列车</span>
+            <span className="text-xl font-mono text-emerald-400">{trains.length}</span>
+          </div>
+          <div className="h-8 w-px bg-slate-700"></div>
+          <div className="flex flex-col">
+            <span className="text-xs text-slate-400 font-medium">仿真速度</span>
+            <span className="text-xl font-mono text-orange-400">{simulationSpeed}x</span>
+          </div>
+          {globalDeadlockWarning && (
+            <>
+              <div className="h-8 w-px bg-slate-700"></div>
+              <div className="flex items-center space-x-2 text-rose-500 animate-pulse font-bold">
+                <span className="text-2xl">⚠</span>
+                <span>系统拥堵</span>
+              </div>
+            </>
+          )}
         </div>
 
         <div 
@@ -924,12 +1231,11 @@ function App() {
         >
           <div className="absolute inset-0 opacity-10 pointer-events-none" 
             style={{ 
-               backgroundImage: `linear-gradient(#475569 1px, transparent 1px), linear-gradient(90deg, #475569 1px, transparent 1px)`,
-               backgroundSize: `${CELL_SIZE}px ${CELL_SIZE}px`
+              backgroundImage: `linear-gradient(#475569 1px, transparent 1px), linear-gradient(90deg, #475569 1px, transparent 1px)`,
+              backgroundSize: `${CELL_SIZE}px ${CELL_SIZE}px`
             }}
           ></div>
 
-          {/* Grid Cells - Set pointer-events-none when running to allow SVG interaction */}
           <div className={`absolute inset-0 grid z-10 ${isRunning ? 'pointer-events-none' : 'pointer-events-auto'}`} style={{ 
             gridTemplateColumns: `repeat(${GRID_W}, 1fr)`,
             gridTemplateRows: `repeat(${GRID_H}, 1fr)`
@@ -938,7 +1244,6 @@ function App() {
               const x = i % GRID_W;
               const y = Math.floor(i / GRID_W);
               const id = getCellId(x, y);
-              const cell = grid[id];
               return (
                 <div 
                   key={id}
@@ -962,7 +1267,7 @@ function App() {
                 <rect x={s.x * CELL_SIZE + 2} y={s.y * CELL_SIZE + 4} width={CELL_SIZE - 4} height={CELL_SIZE - 8} fill="#000" opacity="0.3" rx="4" />
                 <rect x={s.x * CELL_SIZE + 2} y={s.y * CELL_SIZE + 2} width={CELL_SIZE - 4} height={CELL_SIZE - 8} fill="#3b82f6" stroke="#60a5fa" strokeWidth="1" rx="4" />
                 <g transform={`translate(${s.x * CELL_SIZE + CELL_SIZE/2}, ${s.y * CELL_SIZE - 8})`}>
-                  <rect x="-20" y="-8" width="40" height="14" rx="3" fill="#1e293b" stroke="#475569" strokeWidth="1" />
+                  <rect x="-24" y="-8" width="48" height="14" rx="3" fill="#1e293b" stroke="#475569" strokeWidth="1" />
                   <text x="0" y="2" textAnchor="middle" fill="#e2e8f0" fontSize="9" fontWeight="bold" dominantBaseline="middle">{s.stationName}</text>
                 </g>
               </g>
@@ -982,12 +1287,11 @@ function App() {
               return (
                 <g 
                   key={t.id} 
-                  style={{ transition: `all ${TICK_RATE_MS}ms linear` }}
+                  style={{ transition: `all ${BASE_TICK_RATE_MS / simulationSpeed}ms linear` }}
                   className="pointer-events-auto cursor-help"
                   onMouseEnter={() => setHoveredTrainId(t.id)}
                   onMouseLeave={() => setHoveredTrainId(null)}
                 >
-                  {/* Warning Icon if Stuck */}
                   {isStuck && (
                     <text x={screenX} y={screenY - 24} textAnchor="middle" fontSize="16" className="animate-bounce">⚠️</text>
                   )}
@@ -1004,7 +1308,7 @@ function App() {
                     className="shadow-lg drop-shadow-md"
                   />
                   <text x={screenX} y={screenY - 14} textAnchor="middle" fill="white" fontSize="10" fontWeight="bold" filter="drop-shadow(0px 1px 1px rgba(0,0,0,0.8))">
-                     {t.isCyclic ? '↻' : ''}{t.name}
+                    {t.isCyclic ? '↻' : ''}{t.name}
                   </text>
                 </g>
               );
@@ -1026,13 +1330,13 @@ function App() {
                 <span className="px-1.5 rounded-full" style={{backgroundColor: hoveredTrainInfo.color}}></span>
               </div>
               <div className="flex justify-between">
-                 <span>状态:</span> 
-                 <span className={hoveredTrainInfo.state === 'waiting' ? 'text-red-400' : (hoveredTrainInfo.state === 'dwelling' ? 'text-yellow-400' : 'text-emerald-400')}>
-                    {hoveredTrainInfo.state === 'waiting' ? '等待中' : (hoveredTrainInfo.state === 'dwelling' ? '折返中' : '运行中')}
-                 </span>
+                <span>状态:</span> 
+                <span className={hoveredTrainInfo.state === 'waiting' ? 'text-red-400' : (hoveredTrainInfo.state === 'dwelling' ? 'text-yellow-400' : 'text-emerald-400')}>
+                  {hoveredTrainInfo.state === 'waiting' ? '等待中' : (hoveredTrainInfo.state === 'dwelling' ? '折返中' : '运行中')}
+                </span>
               </div>
               {hoveredTrainInfo.state === 'dwelling' && (
-                 <div className="flex justify-between"><span>折返剩余:</span> <span className="text-yellow-400">{hoveredTrainInfo.dwellRemaining}s</span></div>
+                <div className="flex justify-between"><span>折返剩余:</span> <span className="text-yellow-400">{hoveredTrainInfo.dwellRemaining}s</span></div>
               )}
               <div className="flex justify-between"><span>等待:</span> <span className={`${hoveredTrainInfo.waitingTime > 20 ? 'text-rose-400 font-bold' : 'text-slate-400'}`}>{hoveredTrainInfo.waitingTime} Ticks</span></div>
               <div className="flex justify-between"><span>优先级:</span> <span className="text-orange-300 font-mono">P{hoveredTrainInfo.priority}</span></div>
@@ -1045,7 +1349,7 @@ function App() {
           <div className="flex items-center space-x-1"><span className="w-3 h-3 bg-blue-500 rounded"></span><span>车站</span></div>
           <div className="flex items-center space-x-1"><span className="w-3 h-3 bg-slate-600 rounded"></span><span>轨道</span></div>
           <div className="border-l border-slate-700 pl-2">
-            操作: 左键拖拽铺路/点击建站 | 右键拖拽擦除 | 悬浮查看车辆详情 | 双击重命名
+            操作: 左键拖拽铺路/点击建站 | 右键拖拽擦除 | 悬浮查看详情 | 双击重命名
           </div>
         </div>
       </div>
@@ -1056,18 +1360,26 @@ function App() {
           <h1 className="text-2xl font-bold bg-clip-text text-transparent bg-gradient-to-r from-blue-400 to-cyan-300">
             列车调度中心
           </h1>
-          <p className="text-xs text-slate-500 mt-1">Advanced Train Dispatch System</p>
+          <p className="text-xs text-slate-500 mt-1">Advanced Train Dispatch System v2.0</p>
         </div>
 
-        <div className="flex-1 overflow-y-auto p-4 space-y-6">
+        <div className="flex-1 overflow-y-auto p-4 space-y-4">
 
+          {/* 控制按钮 */}
           <div className="flex space-x-2">
             <button 
               onClick={() => setIsRunning(!isRunning)}
               className={`flex-1 py-2 px-4 rounded-lg font-bold text-white shadow-lg transition-all active:scale-95 text-sm
                 ${isRunning ? 'bg-rose-600 hover:bg-rose-700' : 'bg-emerald-600 hover:bg-emerald-700'}`}
             >
-              {isRunning ? "⏹ 停止仿真" : "▶ 启动仿真"}
+              {isRunning ? "⏹ 停止" : "▶ 启动"}
+            </button>
+            <button 
+              onClick={clearAllTrains}
+              className="px-3 py-2 bg-orange-600 hover:bg-orange-500 text-white rounded-lg font-bold shadow-lg text-sm active:scale-95"
+              title="清除所有运行中的列车"
+            >
+              🗑
             </button>
             <button 
               onClick={resetSystem}
@@ -1077,6 +1389,31 @@ function App() {
             </button>
           </div>
           
+          {/* 速度控制 */}
+          <div className="bg-slate-800/50 p-3 rounded-lg border border-slate-700">
+            <div className="flex justify-between items-center mb-2">
+              <span className="text-xs text-slate-400">仿真速度</span>
+              <span className="text-sm font-mono text-orange-400">{simulationSpeed}x</span>
+            </div>
+            <input 
+              type="range" 
+              min="0.5" 
+              max="5" 
+              step="0.5"
+              value={simulationSpeed} 
+              onChange={(e) => setSimulationSpeed(Number(e.target.value))} 
+              className="w-full h-1 bg-slate-700 rounded-lg appearance-none cursor-pointer accent-orange-500"
+            />
+            <div className="flex justify-between text-[10px] text-slate-500 mt-1">
+              <span>0.5x</span>
+              <span>1x</span>
+              <span>2x</span>
+              <span>3x</span>
+              <span>5x</span>
+            </div>
+          </div>
+
+          {/* 编辑模式 */}
           <div className="flex space-x-2 bg-slate-800/50 p-2 rounded-lg text-xs text-slate-400 border border-slate-700">
             <button className={`flex-1 py-1 rounded ${editMode === 'track' ? 'bg-slate-600 text-white' : 'hover:bg-slate-700'}`} onClick={() => setEditMode('track')}>
               轨道模式
@@ -1086,6 +1423,85 @@ function App() {
             </button>
           </div>
 
+          {/* 一键批量发车 */}
+          <div className="bg-gradient-to-br from-emerald-900/40 to-teal-900/40 rounded-xl p-4 border border-emerald-500/30">
+            <h2 className="text-xs font-bold text-emerald-300 uppercase tracking-wider mb-3 flex items-center gap-2">
+              🚄 一键批量测试
+            </h2>
+            
+            {/* 快捷按钮 */}
+            <div className="grid grid-cols-4 gap-2 mb-3">
+              <button 
+                onClick={() => quickBatchDispatch(5, true)}
+                className="bg-emerald-600 hover:bg-emerald-500 text-white py-2 rounded-lg text-xs font-bold shadow-lg active:scale-95"
+              >
+                5辆
+              </button>
+              <button 
+                onClick={() => quickBatchDispatch(10, true)}
+                className="bg-emerald-600 hover:bg-emerald-500 text-white py-2 rounded-lg text-xs font-bold shadow-lg active:scale-95"
+              >
+                10辆
+              </button>
+              <button 
+                onClick={() => quickBatchDispatch(20, true)}
+                className="bg-emerald-600 hover:bg-emerald-500 text-white py-2 rounded-lg text-xs font-bold shadow-lg active:scale-95"
+              >
+                20辆
+              </button>
+              <button 
+                onClick={() => quickBatchDispatch(50, true)}
+                className="bg-teal-600 hover:bg-teal-500 text-white py-2 rounded-lg text-xs font-bold shadow-lg active:scale-95"
+              >
+                50辆
+              </button>
+            </div>
+            
+            {/* 高级设置 */}
+            <div className="space-y-2 border-t border-emerald-700/50 pt-3">
+              <div className="flex items-center gap-2">
+                <span className="text-xs text-slate-300 w-16">数量:</span>
+                <input 
+                  type="number" 
+                  min="1" 
+                  max="100" 
+                  value={batchCount} 
+                  onChange={(e) => setBatchCount(Math.min(100, Math.max(1, Number(e.target.value))))}
+                  className="flex-1 bg-slate-900 border border-slate-600 text-xs rounded p-1.5 text-slate-200 outline-none w-16"
+                />
+              </div>
+              <div className="flex items-center gap-2">
+                <span className="text-xs text-slate-300 w-16">间隔:</span>
+                <input 
+                  type="number" 
+                  min="1" 
+                  max="50" 
+                  value={batchDelay} 
+                  onChange={(e) => setBatchDelay(Math.min(50, Math.max(1, Number(e.target.value))))}
+                  className="flex-1 bg-slate-900 border border-slate-600 text-xs rounded p-1.5 text-slate-200 outline-none w-16"
+                />
+                <span className="text-[10px] text-slate-500">Tick</span>
+              </div>
+              <div className="flex items-center gap-2">
+                <input 
+                  type="checkbox" 
+                  id="batchCyclicCheck" 
+                  checked={batchIsCyclic} 
+                  onChange={(e) => setBatchIsCyclic(e.target.checked)} 
+                  className="rounded bg-slate-800 border-slate-600" 
+                />
+                <label htmlFor="batchCyclicCheck" className="text-xs text-slate-300 select-none cursor-pointer">循环往返</label>
+              </div>
+              <button 
+                onClick={batchDispatchTrains}
+                className="w-full bg-gradient-to-r from-emerald-600 to-teal-600 hover:from-emerald-500 hover:to-teal-500 text-white py-2 rounded-lg text-xs font-bold shadow-lg active:scale-95"
+              >
+                🚀 按设置批量发车
+              </button>
+            </div>
+          </div>
+
+          {/* 单次发车 */}
           <div className="bg-slate-800/50 rounded-xl p-4 border border-slate-700">
             <h2 className="text-xs font-bold text-slate-400 uppercase tracking-wider mb-3">临时发车指令</h2>
             <div className="space-y-3">
@@ -1100,88 +1516,142 @@ function App() {
                 </select>
               </div>
               <div className="flex items-center gap-2">
-                 <input type="checkbox" id="cyclicCheck" checked={dispatchIsCyclic} onChange={(e) => setDispatchIsCyclic(e.target.checked)} className="rounded bg-slate-800 border-slate-600" />
-                 <label htmlFor="cyclicCheck" className="text-xs text-slate-300 select-none cursor-pointer">循环发车 (往返运行)</label>
+                <input type="checkbox" id="cyclicCheck" checked={dispatchIsCyclic} onChange={(e) => setDispatchIsCyclic(e.target.checked)} className="rounded bg-slate-800 border-slate-600" />
+                <label htmlFor="cyclicCheck" className="text-xs text-slate-300 select-none cursor-pointer">循环发车</label>
               </div>
-              <input type="range" min="1" max="10" value={dispatchPriority} onChange={(e) => setDispatchPriority(Number(e.target.value))} className="w-full h-1 bg-slate-700 rounded-lg appearance-none cursor-pointer accent-orange-500"/>
+              <div className="flex items-center gap-2">
+                <span className="text-xs text-slate-400">优先级: P{dispatchPriority}</span>
+                <input type="range" min="1" max="10" value={dispatchPriority} onChange={(e) => setDispatchPriority(Number(e.target.value))} className="flex-1 h-1 bg-slate-700 rounded-lg appearance-none cursor-pointer accent-orange-500"/>
+              </div>
               <button onClick={handleManualDispatch} disabled={previewPath.length === 0 || dispatchFrom === dispatchTo} className="w-full bg-orange-600 hover:bg-orange-500 disabled:bg-slate-700 text-white py-2 rounded-lg text-xs font-bold shadow-lg">立即发车</button>
             </div>
           </div>
 
-          {/* Pending Trains Queue */}
-          <div className="bg-slate-800/30 rounded-xl border border-slate-700 overflow-hidden min-h-[100px]">
-             <div className="p-3 bg-slate-800/80 border-b border-slate-700 flex justify-between items-center">
-               <label className="text-xs font-bold text-yellow-500 uppercase flex items-center gap-1">
-                 <span>⏳</span> 候车队列 (未发车)
-               </label>
-               <span className="text-[10px] bg-slate-700 px-2 py-0.5 rounded-full text-slate-300">{pendingTrains.length}</span>
-             </div>
-             <div className="max-h-32 overflow-y-auto custom-scrollbar p-2 space-y-1">
-                {pendingTrains.length === 0 && <p className="text-[10px] text-slate-600 text-center py-2">队列空闲</p>}
-                {pendingTrains.map(item => (
-                   <div key={item.id} className="flex justify-between items-center text-[10px] p-2 rounded bg-slate-800 border border-slate-700 text-slate-300">
-                      <span>T+{item.time}s | {item.from} → {item.to}</span>
-                      <span className="text-yellow-500">Waiting</span>
-                   </div>
-                ))}
-             </div>
+          {/* 队列状态 */}
+          <div className="bg-slate-800/30 rounded-xl border border-slate-700 overflow-hidden">
+            <div className="p-3 bg-slate-800/80 border-b border-slate-700 flex justify-between items-center">
+              <label className="text-xs font-bold text-yellow-500 uppercase flex items-center gap-1">
+                <span>⏳</span> 发车队列
+              </label>
+              <span className="text-[10px] bg-slate-700 px-2 py-0.5 rounded-full text-slate-300">
+                计划:{pendingTrains.length} | 批量:{pendingBatchCount}
+              </span>
+            </div>
+            <div className="max-h-24 overflow-y-auto custom-scrollbar p-2 space-y-1">
+              {pendingTrains.length === 0 && pendingBatchCount === 0 && <p className="text-[10px] text-slate-600 text-center py-2">队列空闲</p>}
+              {pendingTrains.map(item => (
+                <div key={item.id} className="flex justify-between items-center text-[10px] p-2 rounded bg-slate-800 border border-slate-700 text-slate-300">
+                  <span>T+{item.time}s | {item.from} → {item.to}</span>
+                  <span className="text-yellow-500">计划</span>
+                </div>
+              ))}
+              {pendingBatchCount > 0 && (
+                <div className="text-[10px] p-2 rounded bg-emerald-900/30 border border-emerald-700/50 text-emerald-300 text-center">
+                  批量发车队列中还有 {pendingBatchCount} 辆待发
+                </div>
+              )}
+            </div>
           </div>
 
-          {/* Dispatched History & Filtering */}
-          <div className="flex-1 flex flex-col min-h-[250px] bg-slate-800/30 rounded-xl border border-slate-700 overflow-hidden">
-             <div className="p-3 bg-slate-800/80 border-b border-slate-700 space-y-2">
-               <div className="flex justify-between items-center">
-                 <label className="text-xs font-bold text-slate-400 uppercase">历史路线 (已去重)</label>
-                 <span className="text-[10px] bg-slate-700 px-2 py-0.5 rounded-full text-slate-300">{uniqueHistory.length}</span>
-               </div>
-               
-               {/* Filters */}
-               <div className="flex gap-2">
-                  <select className="flex-1 bg-slate-900 border border-slate-600 text-[10px] rounded p-1 text-slate-200 outline-none" 
-                    value={historyFilterFrom} onChange={(e) => setHistoryFilterFrom(e.target.value)}>
-                    <option value="">全部始发...</option>
-                    {stations.map(s => <option key={s.id} value={s.stationName}>{s.stationName}</option>)}
-                  </select>
-                  <select className="flex-1 bg-slate-900 border border-slate-600 text-[10px] rounded p-1 text-slate-200 outline-none" 
-                    value={historyFilterTo} onChange={(e) => setHistoryFilterTo(e.target.value)}>
-                    <option value="">全部终点...</option>
-                    {stations.map(s => <option key={s.id} value={s.stationName}>{s.stationName}</option>)}
-                  </select>
-               </div>
-             </div>
+          {/* 历史记录 */}
+          <div className="flex-1 flex flex-col min-h-[150px] bg-slate-800/30 rounded-xl border border-slate-700 overflow-hidden">
+            <div className="p-3 bg-slate-800/80 border-b border-slate-700 space-y-2">
+              <div className="flex justify-between items-center">
+                <label className="text-xs font-bold text-slate-400 uppercase">历史路线</label>
+                <span className="text-[10px] bg-slate-700 px-2 py-0.5 rounded-full text-slate-300">{uniqueHistory.length}</span>
+              </div>
+              
+              <div className="flex gap-2">
+                <select className="flex-1 bg-slate-900 border border-slate-600 text-[10px] rounded p-1 text-slate-200 outline-none" 
+                  value={historyFilterFrom} onChange={(e) => setHistoryFilterFrom(e.target.value)}>
+                  <option value="">全部始发...</option>
+                  {stations.map(s => <option key={s.id} value={s.stationName}>{s.stationName}</option>)}
+                </select>
+                <select className="flex-1 bg-slate-900 border border-slate-600 text-[10px] rounded p-1 text-slate-200 outline-none" 
+                  value={historyFilterTo} onChange={(e) => setHistoryFilterTo(e.target.value)}>
+                  <option value="">全部终点...</option>
+                  {stations.map(s => <option key={s.id} value={s.stationName}>{s.stationName}</option>)}
+                </select>
+              </div>
+            </div>
 
-             <div className="overflow-y-auto flex-1 p-2 space-y-1 custom-scrollbar">
-               {uniqueHistory.length === 0 && <p className="text-[10px] text-slate-600 text-center py-4">无历史记录</p>}
-               {uniqueHistory.map(item => (
-                 <div key={item.id} className="flex justify-between items-center text-xs p-2 rounded-lg bg-slate-800/50 hover:bg-slate-800 border border-transparent hover:border-slate-600 group transition-all">
-                   <div className="flex flex-col">
-                      <div className="flex items-center gap-2">
-                         <span className="font-mono font-bold text-slate-400">P{item.priority}</span>
-                         <span className={`text-[9px] px-1 rounded ${item.type === 'manual' ? 'bg-orange-900/50 text-orange-400' : 'bg-blue-900/50 text-blue-400'}`}>
-                           {item.type === 'manual' ? '手动' : '计划'}
-                         </span>
-                         {item.isCyclic && <span className="text-[9px] px-1 rounded bg-purple-900/50 text-purple-400">循环</span>}
-                      </div>
-                      <span className="text-[10px] mt-0.5">{item.from} ➔ {item.to}</span>
-                   </div>
-                   <button 
-                     onClick={() => dispatchTrain(item.from, item.to, item.priority, true, item.isCyclic)}
-                     className="opacity-0 group-hover:opacity-100 bg-emerald-600 hover:bg-emerald-500 text-white px-2 py-1 rounded text-[10px] transition-opacity"
-                     title="使用相同参数再次发车"
-                   >
-                     ↺ 再发
-                   </button>
-                 </div>
-               ))}
-             </div>
+            <div className="overflow-y-auto flex-1 p-2 space-y-1 custom-scrollbar">
+              {uniqueHistory.length === 0 && <p className="text-[10px] text-slate-600 text-center py-4">无历史记录</p>}
+              {uniqueHistory.slice(0, 20).map(item => (
+                <div key={item.id} className="flex justify-between items-center text-xs p-2 rounded-lg bg-slate-800/50 hover:bg-slate-800 border border-transparent hover:border-slate-600 group transition-all">
+                  <div className="flex flex-col">
+                    <div className="flex items-center gap-2">
+                      <span className="font-mono font-bold text-slate-400">P{item.priority}</span>
+                      <span className={`text-[9px] px-1 rounded ${item.type === 'manual' ? 'bg-orange-900/50 text-orange-400' : (item.type === 'batch' ? 'bg-emerald-900/50 text-emerald-400' : 'bg-blue-900/50 text-blue-400')}`}>
+                        {item.type === 'manual' ? '手动' : (item.type === 'batch' ? '批量' : '计划')}
+                      </span>
+                      {item.isCyclic && <span className="text-[9px] px-1 rounded bg-purple-900/50 text-purple-400">循环</span>}
+                    </div>
+                    <span className="text-[10px] mt-0.5">{item.from} ➔ {item.to}</span>
+                  </div>
+                  <button 
+                    onClick={() => dispatchTrain(item.from, item.to, item.priority, 'manual', item.isCyclic)}
+                    className="opacity-0 group-hover:opacity-100 bg-emerald-600 hover:bg-emerald-500 text-white px-2 py-1 rounded text-[10px] transition-opacity"
+                    title="再次发车"
+                  >
+                    ↺
+                  </button>
+                </div>
+              ))}
+            </div>
           </div>
 
+          {/* AI调度 */}
           <div className="bg-gradient-to-br from-indigo-900/40 to-purple-900/40 rounded-xl p-4 border border-indigo-500/30">
             <h2 className="text-xs font-bold text-indigo-300 uppercase tracking-wider mb-2">AI 智能调度</h2>
             <textarea className="w-full bg-slate-900/80 border border-indigo-500/30 rounded-lg p-2 text-xs text-indigo-100 h-16 outline-none resize-none" placeholder="描述场景..." value={aiPrompt} onChange={(e) => setAiPrompt(e.target.value)} />
             <button onClick={generateScheduleWithAI} disabled={isAiLoading || !aiPrompt} className="w-full mt-2 bg-indigo-600 hover:bg-indigo-500 disabled:bg-slate-700 text-white py-1.5 rounded-lg text-xs font-bold">
               {isAiLoading ? "生成中..." : "生成计划"}
             </button>
+          </div>
+
+          {/* 算法性能对比测试 */}
+          <div className="bg-slate-800/50 rounded-xl p-4 border border-slate-700">
+            <h2 className="text-xs font-bold text-slate-400 uppercase tracking-wider mb-3">🚀 算法效率评估</h2>
+            
+            {!benchmarkResult ? (
+              <div className="text-center py-2">
+                 <p className="text-[10px] text-slate-500 mb-3">
+                   对比【二叉堆优化 A*】与【传统数组排序 A*】。
+                   将在 100x100 的复杂虚拟网格中执行 100 次长距离搜索。
+                 </p>
+                 <button 
+                   onClick={runAlgorithmBenchmark} 
+                   disabled={isBenchmarking}
+                   className="w-full bg-slate-700 hover:bg-slate-600 disabled:opacity-50 text-slate-200 py-2 rounded-lg text-xs font-bold"
+                 >
+                   {isBenchmarking ? "正在进行高强度压测..." : "开始大规模性能测试"}
+                 </button>
+              </div>
+            ) : (
+              <div className="space-y-2 animate-in fade-in duration-500">
+                 <div className="grid grid-cols-2 gap-2 text-center mb-2">
+                    <div className="bg-slate-900/80 p-2 rounded border border-red-900/30">
+                       <div className="text-[10px] text-slate-500">旧算法耗时</div>
+                       <div className="text-sm font-mono text-red-400">{benchmarkResult.legacyTime.toFixed(1)}ms</div>
+                    </div>
+                    <div className="bg-slate-900/80 p-2 rounded border border-emerald-900/30">
+                       <div className="text-[10px] text-slate-500">新算法耗时</div>
+                       <div className="text-sm font-mono text-emerald-400">{benchmarkResult.newTime.toFixed(1)}ms</div>
+                    </div>
+                 </div>
+                 <div className="bg-emerald-900/20 border border-emerald-500/30 p-2 rounded text-center">
+                    <div className="text-[10px] text-emerald-300 mb-1">性能提升</div>
+                    <div className="text-lg font-bold text-emerald-400">{benchmarkResult.improvement}</div>
+                 </div>
+                 <button 
+                   onClick={() => setBenchmarkResult(null)} 
+                   className="w-full mt-2 text-[10px] text-slate-500 hover:text-slate-300 underline"
+                 >
+                   重置测试
+                 </button>
+              </div>
+            )}
           </div>
 
         </div>
