@@ -214,6 +214,9 @@ function App() {
   } | null>(null);
   const [isBenchmarking, setIsBenchmarking] = useState(false);
 
+  // 地图缩放状态
+  const [mapScale, setMapScale] = useState(1);
+
   // Refs
   const gridRef = useRef(grid);
   const trainsRef = useRef(trains);
@@ -257,6 +260,12 @@ function App() {
     addStation(45, 20, "东南站");
 
     setGrid(initialGrid);
+    
+    // 移动端初始缩放适配
+    if (window.innerWidth < 768) {
+        const fitScale = Math.min(window.innerWidth / (GRID_W * CELL_SIZE + 48), 0.8); // 48 is padding
+        setMapScale(Math.max(0.3, fitScale));
+    }
   }, []);
 
   useEffect(() => {
@@ -309,7 +318,7 @@ function App() {
   const clearTracks = useCallback(() => {
     setGrid(prev => {
       const next = { ...prev };
-      Object.values(next).forEach(cell => {
+      (Object.values(next) as Cell[]).forEach(cell => {
         if (cell.type === 'track') {
           next[cell.id] = { ...cell, type: 'empty' };
         }
@@ -1062,6 +1071,10 @@ function App() {
     dispatchTrain(dispatchFrom, dispatchTo, dispatchPriority, 'manual', dispatchIsCyclic);
   };
 
+  const zoomIn = () => setMapScale(prev => Math.min(prev + 0.1, 3));
+  const zoomOut = () => setMapScale(prev => Math.max(prev - 0.1, 0.2));
+  const resetZoom = () => setMapScale(1);
+
   // --- Render Helpers ---
 
   const trackLines = useMemo(() => {
@@ -1174,9 +1187,9 @@ function App() {
   }, [history, historyFilterFrom, historyFilterTo]);
 
   return (
-    <div className="flex flex-row h-full bg-slate-900 text-slate-100 font-sans select-none">
+    <div className="flex flex-col md:flex-row h-full bg-slate-900 text-slate-100 font-sans select-none overflow-hidden">
       {/* LEFT PANEL: MAP */}
-      <div className="flex-1 relative flex flex-col h-full bg-slate-950 overflow-hidden">
+      <div className="flex-1 relative flex flex-col h-2/3 md:h-full bg-slate-950 overflow-hidden order-1">
         
         {/* Header Indicators */}
         <div className="absolute top-4 left-6 flex items-center space-x-4 bg-slate-900/80 backdrop-blur-md p-3 rounded-xl border border-slate-800 shadow-xl z-20 pointer-events-none">
@@ -1205,13 +1218,31 @@ function App() {
           )}
         </div>
 
-        <div className="flex-1 overflow-auto w-full h-full p-6">
-          <div className="min-w-min min-h-min flex items-center justify-center">
+        <div className="flex-1 overflow-auto w-full h-full p-6 relative touch-auto">
+           {/* Zoom Controls */}
+           <div className="fixed md:absolute bottom-8 right-8 flex flex-col gap-2 z-30 pointer-events-auto">
+            <button onClick={zoomIn} className="w-10 h-10 bg-slate-800/90 hover:bg-slate-700 text-white rounded-lg shadow-xl border border-slate-600 flex items-center justify-center font-bold text-xl active:scale-95">＋</button>
+            <button onClick={resetZoom} className="w-10 h-10 bg-slate-800/90 hover:bg-slate-700 text-white rounded-lg shadow-xl border border-slate-600 flex items-center justify-center font-bold text-xs active:scale-95">{Math.round(mapScale * 100)}%</button>
+            <button onClick={zoomOut} className="w-10 h-10 bg-slate-800/90 hover:bg-slate-700 text-white rounded-lg shadow-xl border border-slate-600 flex items-center justify-center font-bold text-xl active:scale-95">－</button>
+          </div>
+
+          <div 
+            className="min-w-min min-h-min flex items-center justify-center origin-top-left transition-all duration-200"
+            style={{ 
+              width: (GRID_W * CELL_SIZE) * mapScale + 48, // 48 for padding
+              height: (GRID_H * CELL_SIZE) * mapScale + 48 
+            }}
+          >
             <div 
-              className="relative bg-slate-900/50 shadow-2xl border border-slate-800 rounded-lg backdrop-blur-sm transition-all duration-300"
-          style={{ width: GRID_W * CELL_SIZE, height: GRID_H * CELL_SIZE }}
-          onContextMenu={(e) => e.preventDefault()}
-        >
+              className="relative bg-slate-900/50 shadow-2xl border border-slate-800 rounded-lg backdrop-blur-sm"
+              style={{ 
+                width: GRID_W * CELL_SIZE, 
+                height: GRID_H * CELL_SIZE,
+                transform: `scale(${mapScale})`,
+                transformOrigin: 'center center'
+              }}
+              onContextMenu={(e) => e.preventDefault()}
+            >
           <div className="absolute inset-0 opacity-10 pointer-events-none" 
             style={{ 
               backgroundImage: `linear-gradient(#475569 1px, transparent 1px), linear-gradient(90deg, #475569 1px, transparent 1px)`,
@@ -1340,15 +1371,18 @@ function App() {
       </div>
 
       {/* RIGHT PANEL */}
-      <div className="w-96 bg-slate-900 border-l border-slate-800 flex flex-col shadow-2xl z-20">
-        <div className="p-6 border-b border-slate-800 bg-slate-900">
-          <h1 className="text-2xl font-bold bg-clip-text text-transparent bg-gradient-to-r from-blue-400 to-cyan-300">
-            列车调度中心
-          </h1>
-          <p className="text-xs text-slate-500 mt-1">Advanced Train Dispatch System v2.0</p>
+      <div className="w-full md:w-96 h-1/3 md:h-auto bg-slate-900 border-t md:border-t-0 md:border-l border-slate-800 flex flex-col shadow-2xl z-20 order-2">
+        <div className="p-4 md:p-6 border-b border-slate-800 bg-slate-900 flex justify-between items-center md:block">
+          <div>
+            <h1 className="text-lg md:text-2xl font-bold bg-clip-text text-transparent bg-gradient-to-r from-blue-400 to-cyan-300">
+              列车调度中心
+            </h1>
+            <p className="text-[10px] md:text-xs text-slate-500 mt-1">Advanced Train Dispatch System v2.0</p>
+          </div>
+          {/* Mobile Only Toggle or Status could go here */}
         </div>
 
-        <div className="flex-1 overflow-y-auto p-4 space-y-4">
+        <div className="flex-1 overflow-y-auto p-4 space-y-4 pb-20 md:pb-4">
 
           {/* 控制按钮 */}
           <div className="flex space-x-2">
